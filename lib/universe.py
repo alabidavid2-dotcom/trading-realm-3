@@ -3,13 +3,11 @@ universe.py — Refined Trading Universe Manager
 PTR Score: PTR = (grade_accuracy * capital_efficiency) / (regime_complexity * data_penalty)
 """
 
-import json
-import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from config import supabase
 
 ET = ZoneInfo("America/New_York")
-UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "universe.json")
 MAX_UNIVERSE_SIZE = 15
 
 SECTOR_GROUPS = {
@@ -43,19 +41,32 @@ def get_sector_for_ticker(ticker: str) -> str:
 
 
 def load_universe() -> list[dict]:
-    if not os.path.exists(UNIVERSE_FILE):
-        return []
     try:
-        with open(UNIVERSE_FILE, 'r') as f:
-            return json.load(f)
+        res = supabase.table('universe_members').select('*').order('score', desc=True).execute()
+        return res.data or []
     except Exception:
         return []
 
 
 def save_universe(data: list[dict]):
+    """Full replacement — delete all rows then re-insert."""
     try:
-        with open(UNIVERSE_FILE, 'w') as f:
-            json.dump(data, f, indent=2, default=str)
+        supabase.table('universe_members').delete().neq('ticker', '').execute()
+        if data:
+            records = []
+            for u in data:
+                records.append({
+                    'ticker':    u.get('ticker'),
+                    'sector':    u.get('sector', get_sector_for_ticker(u.get('ticker', ''))),
+                    'added_at':  u.get('added_at', datetime.now(ET).isoformat()),
+                    'score':     float(u.get('score', u.get('universe_score', 0))),
+                    'ptr_score': float(u.get('ptr_score', 0)),
+                    'metadata':  {
+                        k: v for k, v in u.items()
+                        if k not in ('ticker', 'sector', 'added_at', 'score', 'ptr_score', 'id')
+                    },
+                })
+            supabase.table('universe_members').insert(records).execute()
     except Exception:
         pass
 
@@ -130,26 +141,34 @@ def add_to_universe(ticker: str, metadata: dict = None) -> tuple[bool, str]:
         return False, f"Universe full ({MAX_UNIVERSE_SIZE} max). Remove a ticker first."
     if any(u['ticker'] == ticker for u in universe):
         return False, f"{ticker} already in universe."
-    entry = {
+
+    meta = metadata or {}
+    record = {
         'ticker':    ticker,
         'sector':    get_sector_for_ticker(ticker),
         'added_at':  datetime.now(ET).isoformat(),
-        'score':     metadata.get('universe_score', 0) if metadata else 0,
-        'ptr_score': metadata.get('ptr_score', 0) if metadata else 0,
-        **(metadata or {}),
+        'score':     float(meta.get('universe_score', 0)),
+        'ptr_score': float(meta.get('ptr_score', 0)),
+        'metadata':  {
+            k: v for k, v in meta.items()
+            if k not in ('ticker', 'sector', 'added_at', 'score', 'ptr_score', 'universe_score')
+        },
     }
-    universe.insert(0, entry)
-    save_universe(universe)
+    try:
+        supabase.table('universe_members').insert(record).execute()
+    except Exception as e:
+        return False, f"DB error adding {ticker}: {e}"
     return True, f"{ticker} added to universe."
 
 
 def remove_from_universe(ticker: str) -> tuple[bool, str]:
-    universe = load_universe()
-    updated  = [u for u in universe if u['ticker'] != ticker]
-    if len(updated) == len(universe):
+    try:
+        res = supabase.table('universe_members').delete().eq('ticker', ticker).execute()
+        if res.data:
+            return True, f"{ticker} removed from universe."
         return False, f"{ticker} not found in universe."
-    save_universe(updated)
-    return True, f"{ticker} removed from universe."
+    except Exception as e:
+        return False, f"DB error removing {ticker}: {e}"
 
 
 def auto_build_universe(scan_history: list[dict]) -> list[dict]:
@@ -192,5 +211,5 @@ def get_universe_summary() -> dict:
         'total':     len(universe),
         'tickers':   [u['ticker'] for u in universe],
         'by_sector': by_sector,
-        'avg_score': round(sum(u.get('score', 0) for u in universe) / max(len(universe), 1), 1),
+        'avg_score': round(sum(float(u.get('score', 0)) for u in universe) / max(len(universe), 1), 1),
     }

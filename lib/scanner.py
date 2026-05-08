@@ -9,7 +9,6 @@ import numpy as np
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
-import os
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -19,8 +18,9 @@ try:
 except ImportError:
     GRADER_AVAILABLE = False
 
+from config import supabase
+
 SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-SCAN_RESULTS_FILE = "scan_history.json"
 
 
 def get_sp500_tickers():
@@ -485,22 +485,28 @@ def detect_simultaneous_sector_breaks(results: list) -> list:
 
 
 def load_scan_history():
-    if os.path.exists(SCAN_RESULTS_FILE):
-        try:
-            with open(SCAN_RESULTS_FILE, 'r') as f:
-                data = json.load(f)
-            if data.get('date') == datetime.now().strftime("%Y-%m-%d"):
-                return data.get('scans', [])
-        except Exception:
-            pass
-    return []
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        res = supabase.table('scan_history').select('raw_data').eq('scan_date', today).execute()
+        return [row['raw_data'] for row in (res.data or [])]
+    except Exception:
+        return []
 
 
 def save_scan_history(scans):
-    data = {'date': datetime.now().strftime("%Y-%m-%d"), 'scans': scans}
+    today = datetime.now().strftime("%Y-%m-%d")
     try:
-        with open(SCAN_RESULTS_FILE, 'w') as f:
-            json.dump(data, f, indent=2, default=str)
+        supabase.table('scan_history').delete().eq('scan_date', today).execute()
+        if scans:
+            records = []
+            for scan in scans:
+                safe = json.loads(json.dumps(scan, default=str))
+                records.append({
+                    'scan_date': today,
+                    'ticker':    scan.get('ticker', 'UNKNOWN'),
+                    'raw_data':  safe,
+                })
+            supabase.table('scan_history').insert(records).execute()
     except Exception:
         pass
 

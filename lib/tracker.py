@@ -1,38 +1,24 @@
 """
 tracker.py — Watchlist Trade Tracker
-Persists tracked tickers + entry data to a local JSON file.
+Persists tracked tickers + entry data to Supabase.
 Survives restarts. Manual clear available.
 """
 
-import json
-import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from config import supabase
 
 ET = ZoneInfo("America/New_York")
-TRACKER_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tracker_data.json")
 
 
-# ── Load / Save ────────────────────────────────────────────────────────────────
+# ── Load ───────────────────────────────────────────────────────────────────────
 
 def load_tracked() -> list[dict]:
-    """Load tracked tickers from disk."""
-    if not os.path.exists(TRACKER_FILE):
-        return []
     try:
-        with open(TRACKER_FILE, "r") as f:
-            return json.load(f)
+        res = supabase.table('tracker_positions').select('*').order('added_at', desc=True).execute()
+        return res.data or []
     except Exception:
         return []
-
-
-def save_tracked(tracked: list[dict]):
-    """Persist tracked tickers to disk."""
-    try:
-        with open(TRACKER_FILE, "w") as f:
-            json.dump(tracked, f, indent=2, default=str)
-    except Exception:
-        pass
 
 
 # ── Add / Remove ───────────────────────────────────────────────────────────────
@@ -49,53 +35,60 @@ def add_tracked(
     note: str = "",
 ) -> list[dict]:
     """Add a ticker to the watchlist tracker. Returns updated list."""
-    tracked = load_tracked()
+    try:
+        existing = supabase.table('tracker_positions').select('ticker').eq('ticker', ticker).eq('active', True).execute()
+        if existing.data:
+            return load_tracked()
+    except Exception:
+        pass
 
-    # Don't duplicate
-    for t in tracked:
-        if t["ticker"] == ticker and t.get("active", True):
-            return tracked
-
+    now = datetime.now(ET)
     entry = {
-        "ticker":       ticker,
-        "grade":        grade,
-        "direction":    direction,
-        "regime":       regime,
-        "signal_score": signal_score,
-        "entry_price":  entry_price,
-        "trade_type":   trade_type,
-        "patterns":     patterns or [],
-        "note":         note,
-        "added_at":     datetime.now(ET).isoformat(),
-        "active":       True,
-        "current_price":entry_price,
-        "pnl_dollars":  0.0,
-        "pnl_pct":      0.0,
-        "last_updated": datetime.now(ET).isoformat(),
+        "ticker":        ticker,
+        "grade":         grade,
+        "direction":     direction,
+        "regime":        regime,
+        "signal_score":  signal_score,
+        "entry_price":   entry_price,
+        "trade_type":    trade_type,
+        "patterns":      patterns or [],
+        "note":          note,
+        "added_at":      now.isoformat(),
+        "active":        True,
+        "current_price": entry_price,
+        "pnl_dollars":   0.0,
+        "pnl_pct":       0.0,
+        "last_updated":  now.isoformat(),
     }
-    tracked.insert(0, entry)
-    save_tracked(tracked)
-    return tracked
+    try:
+        supabase.table('tracker_positions').insert(entry).execute()
+    except Exception:
+        pass
+    return load_tracked()
 
 
 def remove_tracked(ticker: str) -> list[dict]:
     """Remove a ticker from the active tracker."""
-    tracked = load_tracked()
-    tracked = [t for t in tracked if t["ticker"] != ticker]
-    save_tracked(tracked)
-    return tracked
+    try:
+        supabase.table('tracker_positions').delete().eq('ticker', ticker).execute()
+    except Exception:
+        pass
+    return load_tracked()
 
 
 def clear_all_tracked() -> list[dict]:
     """Clear all tracked tickers."""
-    save_tracked([])
+    try:
+        supabase.table('tracker_positions').delete().neq('ticker', '').execute()
+    except Exception:
+        pass
     return []
 
 
 # ── Update prices ──────────────────────────────────────────────────────────────
 
 def update_tracked_prices(tracked: list[dict]) -> list[dict]:
-    """Fetch latest prices and recalculate P&L for all active tracked tickers."""
+    """Fetch latest prices, recalculate P&L, and persist each update to Supabase."""
     if not tracked:
         return tracked
 
@@ -110,7 +103,7 @@ def update_tracked_prices(tracked: list[dict]) -> list[dict]:
                 if df.empty:
                     continue
                 price = float(df['Close'].dropna().iloc[-1])
-                entry = t["entry_price"]
+                entry = float(t["entry_price"])
                 direction = t.get("direction", "LONG")
                 if direction == "LONG":
                     pnl_pct     = (price - entry) / entry * 100
@@ -122,9 +115,15 @@ def update_tracked_prices(tracked: list[dict]) -> list[dict]:
                 t["pnl_pct"]       = round(pnl_pct, 2)
                 t["pnl_dollars"]   = round(pnl_dollars, 4)
                 t["last_updated"]  = datetime.now(ET).isoformat()
+
+                supabase.table('tracker_positions').update({
+                    "current_price": t["current_price"],
+                    "pnl_pct":       t["pnl_pct"],
+                    "pnl_dollars":   t["pnl_dollars"],
+                    "last_updated":  t["last_updated"],
+                }).eq('ticker', sym).execute()
             except Exception:
                 pass
-        save_tracked(tracked)
     except Exception:
         pass
 
@@ -205,7 +204,7 @@ def estimate_option_contract(
         theta_warning = False
         theta_message = ""
 
-    expiry_str     = expiry.strftime("%y%m%d")
+    expiry_str      = expiry.strftime("%y%m%d")
     contract_symbol = f"{ticker}{expiry_str}{'C' if c_or_p=='CALL' else 'P'}{int(strike*1000):08d}"
 
     return {

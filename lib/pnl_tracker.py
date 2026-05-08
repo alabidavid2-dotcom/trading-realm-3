@@ -5,38 +5,29 @@ Stats: win rate, avg win/loss, profit factor, regime breakdown,
        best/worst ticker, time-of-day, streak tracker.
 """
 
-import json
-import os
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
+from config import supabase
 
 ET = ZoneInfo("America/New_York")
-PNL_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "pnl_history.json")
 
 
-# ── Load / Save ────────────────────────────────────────────────────────────────
+# ── Load / Clear ───────────────────────────────────────────────────────────────
 
 def load_pnl_history() -> list[dict]:
-    if not os.path.exists(PNL_FILE):
-        return []
     try:
-        with open(PNL_FILE, "r") as f:
-            return json.load(f)
+        res = supabase.table('pnl_history').select('*').order('timestamp', desc=True).execute()
+        return res.data or []
     except Exception:
         return []
-
-
-def save_pnl_history(history: list[dict]):
-    try:
-        with open(PNL_FILE, "w") as f:
-            json.dump(history, f, indent=2, default=str)
-    except Exception:
-        pass
 
 
 def clear_pnl_history():
-    save_pnl_history([])
+    try:
+        supabase.table('pnl_history').delete().gte('timestamp', '2000-01-01T00:00:00+00:00').execute()
+    except Exception:
+        pass
 
 
 # ── Log a trade result ─────────────────────────────────────────────────────────
@@ -54,19 +45,18 @@ def log_trade_result(
 ):
     """
     Call this when a trade closes.
-    Calculates P&L and appends to persistent history.
+    Calculates P&L and inserts directly to Supabase.
     """
-    history = load_pnl_history()
-    now     = datetime.now(ET)
+    now = datetime.now(ET)
 
     if direction == "LONG":
-        pnl_pct    = (exit_price - entry_price) / entry_price * 100
+        pnl_pct     = (exit_price - entry_price) / entry_price * 100
         pnl_dollars = (exit_price - entry_price) * qty
     else:
-        pnl_pct    = (entry_price - exit_price) / entry_price * 100
+        pnl_pct     = (entry_price - exit_price) / entry_price * 100
         pnl_dollars = (entry_price - exit_price) * qty
 
-    result = {
+    record = {
         "ticker":       ticker,
         "direction":    direction,
         "trade_type":   trade_type,
@@ -85,9 +75,12 @@ def log_trade_result(
         "day_of_week":  now.strftime("%A"),
     }
 
-    history.insert(0, result)
-    save_pnl_history(history)
-    return result
+    try:
+        supabase.table('pnl_history').insert(record).execute()
+    except Exception:
+        pass
+
+    return record
 
 
 # ── Filter by period ───────────────────────────────────────────────────────────
@@ -140,15 +133,15 @@ def calculate_stats(trades: list[dict]) -> dict:
     loss_count  = len(losses)
     win_rate    = round(win_count / total * 100, 1) if total else 0
 
-    avg_win     = round(sum(t["pnl_pct"] for t in wins)   / len(wins),   3) if wins   else 0
-    avg_loss    = round(sum(t["pnl_pct"] for t in losses) / len(losses), 3) if losses else 0
+    avg_win     = round(sum(float(t["pnl_pct"]) for t in wins)   / len(wins),   3) if wins   else 0
+    avg_loss    = round(sum(float(t["pnl_pct"]) for t in losses) / len(losses), 3) if losses else 0
 
-    gross_wins  = sum(t["pnl_pct"] for t in wins)
-    gross_losses = abs(sum(t["pnl_pct"] for t in losses))
+    gross_wins   = sum(float(t["pnl_pct"]) for t in wins)
+    gross_losses = abs(sum(float(t["pnl_pct"]) for t in losses))
     profit_factor = round(gross_wins / gross_losses, 2) if gross_losses > 0 else 999
 
-    total_pnl_pct = round(sum(t["pnl_pct"] for t in trades), 2)
-    total_pnl_dollars = round(sum(t["pnl_dollars"] for t in trades), 2)
+    total_pnl_pct     = round(sum(float(t["pnl_pct"])     for t in trades), 2)
+    total_pnl_dollars = round(sum(float(t["pnl_dollars"]) for t in trades), 2)
 
     # ── Streak ──────────────────────────────────────────────────────────────
     current_streak = 0
@@ -171,7 +164,7 @@ def calculate_stats(trades: list[dict]) -> dict:
     for t in trades:
         r = t.get("regime", "Unknown")
         regime_stats[r]["count"] += 1
-        regime_stats[r]["pnl"]   += t["pnl_pct"]
+        regime_stats[r]["pnl"]   += float(t["pnl_pct"])
         if t.get("win"):
             regime_stats[r]["wins"] += 1
     regime_breakdown = {}
@@ -187,7 +180,7 @@ def calculate_stats(trades: list[dict]) -> dict:
     for t in trades:
         sym = t.get("ticker", "?")
         ticker_stats[sym]["count"] += 1
-        ticker_stats[sym]["pnl"]   += t["pnl_pct"]
+        ticker_stats[sym]["pnl"]   += float(t["pnl_pct"])
         if t.get("win"):
             ticker_stats[sym]["wins"] += 1
 
@@ -206,7 +199,7 @@ def calculate_stats(trades: list[dict]) -> dict:
     for t in trades:
         h = t.get("hour", 0)
         hour_stats[h]["count"] += 1
-        hour_stats[h]["pnl"]   += t["pnl_pct"]
+        hour_stats[h]["pnl"]   += float(t["pnl_pct"])
     by_hour = sorted(hour_stats.items(), key=lambda x: x[1]["pnl"] / max(x[1]["count"], 1), reverse=True)
     best_hour  = f"{by_hour[0][0]}:00"  if by_hour else "—"
     worst_hour = f"{by_hour[-1][0]}:00" if by_hour else "—"

@@ -7,6 +7,7 @@
 import os
 from datetime import datetime
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
 load_dotenv()
 
@@ -82,11 +83,21 @@ COMMISSION_PER_TRADE = 1.50  # Per contract
 ALPACA_API_KEY = os.environ.get('ALPACA_API_KEY')
 ALPACA_SECRET_KEY = os.environ.get('ALPACA_SECRET_KEY')
 
-_missing = [k for k, v in {'ALPACA_API_KEY': ALPACA_API_KEY, 'ALPACA_SECRET_KEY': ALPACA_SECRET_KEY}.items() if not v]
+# --- SUPABASE ---
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+
+_required = {
+    'ALPACA_API_KEY':   ALPACA_API_KEY,
+    'ALPACA_SECRET_KEY': ALPACA_SECRET_KEY,
+    'SUPABASE_URL':     SUPABASE_URL,
+    'SUPABASE_KEY':     SUPABASE_KEY,
+}
+_missing = [k for k, v in _required.items() if not v]
 if _missing:
     raise EnvironmentError(
         f"Missing required environment variable(s): {', '.join(_missing)}\n"
-        "Copy .env.example to .env and fill in your Alpaca credentials."
+        "Copy .env.example to .env and fill in all credentials."
     )
 ALPACA_PAPER_TRADING = True
 ALPACA_BASE_URL = 'https://paper-api.alpaca.markets'
@@ -96,3 +107,6 @@ ALPACA_DATA_DELAY_MINS = 15    # IEX intraday delay in minutes
 
 # --- OUTPUT ---
 REPORT_DATE = datetime.now().strftime("%Y-%m-%d")
+
+# --- SUPABASE CLIENT ---
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)

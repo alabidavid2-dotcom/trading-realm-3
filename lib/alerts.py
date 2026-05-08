@@ -1,48 +1,35 @@
 """
 alerts.py — Alert Management System
-- Stores alerts to JSON, auto-expires after 72 hours
+- Stores alerts to Supabase, auto-expires after 72 hours
 - Banner state management (77-second display)
 - Previous alerts log
 """
 
-import json
-import os
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from config import supabase
 
 ET = ZoneInfo("America/New_York")
-ALERTS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "alerts_log.json")
 ALERT_TTL_HOURS = 72
 
 
-# ── Load / Save ────────────────────────────────────────────────────────────────
+# ── Load ───────────────────────────────────────────────────────────────────────
 
 def load_alerts() -> list[dict]:
-    """Load alerts from disk, auto-purging expired ones."""
-    if not os.path.exists(ALERTS_FILE):
-        return []
+    """Load non-expired alerts from Supabase, ordered newest first."""
     try:
-        with open(ALERTS_FILE, "r") as f:
-            alerts = json.load(f)
-        # Purge expired
-        cutoff = datetime.now(ET) - timedelta(hours=ALERT_TTL_HOURS)
-        alerts = [
-            a for a in alerts
-            if datetime.fromisoformat(a["timestamp"]).replace(tzinfo=ET) > cutoff
-        ]
-        save_alerts(alerts)
-        return alerts
+        now = datetime.now(ET)
+        res = (
+            supabase.table('alerts')
+            .select('*')
+            .gt('expired_at', now.isoformat())
+            .order('timestamp', desc=True)
+            .execute()
+        )
+        return res.data or []
     except Exception:
         return []
-
-
-def save_alerts(alerts: list[dict]):
-    try:
-        with open(ALERTS_FILE, "w") as f:
-            json.dump(alerts, f, indent=2, default=str)
-    except Exception:
-        pass
 
 
 # ── Create alert ───────────────────────────────────────────────────────────────
@@ -55,24 +42,37 @@ def create_alert(
     price: float,
     trade_type: str,
     signal_score: int,
-    source: str = "scanner",  # "scanner" or "single_ticker"
+    source: str = "scanner",
 ) -> dict:
     """
     Create and persist a new alert.
+    Deduplicates: won't fire the same ticker more than once per 30 minutes.
     Returns the alert dict.
     """
-    alerts = load_alerts()
-
-    # Deduplicate — don't fire same ticker alert more than once per 30 minutes
     now = datetime.now(ET)
-    for a in alerts:
-        if a["ticker"] == ticker:
-            last = datetime.fromisoformat(a["timestamp"]).replace(tzinfo=ET)
-            if (now - last).total_seconds() < 1800:  # 30 min cooldown
-                return a  # Return existing alert, don't duplicate
+
+    # 30-minute cooldown check
+    try:
+        res = (
+            supabase.table('alerts')
+            .select('*')
+            .eq('ticker', ticker)
+            .order('timestamp', desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            last_ts = res.data[0]['timestamp']
+            last = datetime.fromisoformat(last_ts)
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=ET)
+            if (now - last).total_seconds() < 1800:
+                return res.data[0]
+    except Exception:
+        pass
 
     alert = {
-        "id":           f"{ticker}_{int(time.time())}",
+        "alert_id":     f"{ticker}_{int(time.time())}",
         "ticker":       ticker,
         "grade":        grade,
         "direction":    direction,
@@ -86,47 +86,60 @@ def create_alert(
         "expired_at":   (now + timedelta(hours=ALERT_TTL_HOURS)).isoformat(),
         "banner_shown": False,
     }
-
-    alerts.insert(0, alert)
-    save_alerts(alerts)
+    try:
+        supabase.table('alerts').insert(alert).execute()
+    except Exception:
+        pass
     return alert
 
 
 def acknowledge_alert(alert_id: str):
     """Mark an alert as acknowledged."""
-    alerts = load_alerts()
-    for a in alerts:
-        if a["id"] == alert_id:
-            a["acknowledged"] = True
-            break
-    save_alerts(alerts)
+    try:
+        supabase.table('alerts').update({"acknowledged": True}).eq('alert_id', alert_id).execute()
+    except Exception:
+        pass
 
 
 def mark_banner_shown(alert_id: str):
     """Mark that the banner was displayed for this alert."""
-    alerts = load_alerts()
-    for a in alerts:
-        if a["id"] == alert_id:
-            a["banner_shown"] = True
-            break
-    save_alerts(alerts)
+    try:
+        supabase.table('alerts').update({"banner_shown": True}).eq('alert_id', alert_id).execute()
+    except Exception:
+        pass
 
 
 def get_pending_banner_alerts() -> list[dict]:
-    """Get alerts that haven't had their banner shown yet."""
-    alerts = load_alerts()
-    return [a for a in alerts if not a.get("banner_shown") and not a.get("acknowledged")]
+    """Get non-expired alerts that haven't had their banner shown yet."""
+    try:
+        now = datetime.now(ET)
+        res = (
+            supabase.table('alerts')
+            .select('*')
+            .eq('banner_shown', False)
+            .eq('acknowledged', False)
+            .gt('expired_at', now.isoformat())
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
 
 
 def clear_all_alerts():
     """Clear all alerts."""
-    save_alerts([])
+    try:
+        supabase.table('alerts').delete().gte('timestamp', '2000-01-01T00:00:00+00:00').execute()
+    except Exception:
+        pass
 
 
 def get_time_remaining(alert: dict) -> str:
     """Get human-readable time until alert expires."""
     try:
-        expired_at = datetime.fromisoformat(alert["expired_at"]).replace(tzinfo=ET)
+        expired_at = datetime.fromisoformat(alert["expired_at"])
+        if expired_at.tzinfo is None:
+            expired_at = expired_at.replace(tzinfo=ET)
         remaining  = expired_at - datetime.now(ET)
         if remaining.total_seconds() <= 0:
             return "Expired"

@@ -1,4 +1,5 @@
 python-dotenv>=1.0.0
+supabase>=2.0.0
 hmmlearn>=0.3.0
 pandas>=2.0.0
 numpy>=1.24.0
