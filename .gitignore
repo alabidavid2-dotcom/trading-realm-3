@@ -1,0 +1,42 @@
+# Environment variables — NEVER commit real credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime logs (Streamlit / subprocess output)
+run_*.txt
+sl_*.txt
+streamlit_*.txt
+*.base64.txt
+
+# Runtime data files (regenerated at runtime)
+scan_history.json
+pnl_history.json
+tracker_data.json
+alerts_log.json
+universe.json
+
+# Editor / tool directories
+.vscode/
+.claude/
