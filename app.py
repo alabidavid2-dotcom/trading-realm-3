@@ -104,6 +104,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
 # ── Global CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -1097,25 +1100,39 @@ page = st.session_state.page
 
 with st.sidebar:
     # ── Admin authentication ──────────────────────────────────────────────────
-    admin_key = st.text_input("🔑 Admin Key", type="password", key="admin_key_input",
-                               placeholder="Enter key to unlock execution")
-    try:
-        _admin_pw = st.secrets.get("ADMIN_PASSWORD", "")
-    except Exception:
-        _admin_pw = ""
-    is_admin = bool(_admin_pw) and (admin_key == _admin_pw)
-    if is_admin:
-        st.success("Admin mode active", icon="✅")
-    elif admin_key:
-        st.error("Incorrect key", icon="❌")
-    else:
+    if st.session_state.authenticated:
         st.markdown(
-            '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.15);'
-            'border-radius:8px;padding:6px 12px;font-family:DM Mono,monospace;'
-            'font-size:10px;color:#475569;text-align:center;margin-bottom:4px;">'
-            '👁️ View-Only Mode — enter key to unlock</div>',
+            '<div style="background:#052e16;border:1px solid rgba(34,197,94,0.35);'
+            'border-radius:8px;padding:8px 12px;font-family:DM Mono,monospace;'
+            'font-size:11px;color:#4ade80;text-align:center;margin-bottom:4px;">'
+            '🔓 Admin Session Active</div>',
             unsafe_allow_html=True,
         )
+        if st.button("Lock Session", key="lock_admin", use_container_width=True):
+            st.session_state.authenticated = False
+            st.rerun()
+    else:
+        admin_key = st.text_input("🔑 Admin Key", type="password", key="admin_key_input",
+                                   placeholder="Enter key to unlock execution")
+        try:
+            _admin_pw = st.secrets.get("ADMIN_PASSWORD", "")
+        except Exception:
+            _admin_pw = ""
+        if admin_key:
+            if bool(_admin_pw) and (admin_key == _admin_pw):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect key", icon="❌")
+        else:
+            st.markdown(
+                '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.15);'
+                'border-radius:8px;padding:6px 12px;font-family:DM Mono,monospace;'
+                'font-size:10px;color:#475569;text-align:center;margin-bottom:4px;">'
+                '👁️ View-Only Mode — enter key to unlock</div>',
+                unsafe_allow_html=True,
+            )
+    is_admin = st.session_state.authenticated
     st.markdown("---")
 
     # ── Show help guide if active, otherwise show settings ───────────────────
@@ -3895,7 +3912,7 @@ elif page == "performance":
         return 'color: #4ade80' if val > 0 else ('color: #f87171' if val < 0 else '')
 
     st.dataframe(
-        _df_display.style.applymap(_color_pnl, subset=['pnl_dollars'] if 'pnl_dollars' in _df_display.columns else []),
+        _df_display.style.map(_color_pnl, subset=['pnl_dollars'] if 'pnl_dollars' in _df_display.columns else []),
         use_container_width=True,
         hide_index=True,
     )
@@ -4109,10 +4126,10 @@ elif page == "db_test":
 
         for col in ["pnl_dollars", "pnl_pct"]:
             if col in df.columns:
-                styled = styled.applymap(_pnl_colour, subset=[col])
+                styled = styled.map(_pnl_colour, subset=[col])
 
         if "win" in df.columns:
-            styled = styled.applymap(
+            styled = styled.map(
                 lambda v: "color: #22c55e" if v is True else ("color: #ef4444" if v is False else ""),
                 subset=["win"],
             )
