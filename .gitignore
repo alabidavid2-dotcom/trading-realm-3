@@ -1,5 +1,6 @@
 # Environment variables — NEVER commit real credentials
-.env
+.env*
+.streamlit/secrets.toml
 
 # Python
 __pycache__/
@@ -36,6 +37,13 @@ pnl_history.json
 tracker_data.json
 alerts_log.json
 universe.json
+
+# ML model artifacts — WARNING: models/hmm_model.pkl (1.7KB) must be
+# force-committed before deploying to Streamlit Community Cloud:
+#   git add -f models/hmm_model.pkl
+# Streamlit Cloud has no post-deploy training step; without it the
+# regime engine crashes on every scan.
+models/*.pkl
 
 # Editor / tool directories
 .vscode/

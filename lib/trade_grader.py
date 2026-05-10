@@ -11,6 +11,25 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
+# ── HMM Regime cache (TTL: 5 min so every grade call doesn't re-fetch) ────────
+_regime_cache: dict = {}
+_regime_cache_ts: float = 0.0
+_REGIME_TTL: float = 300.0   # seconds
+
+
+def _get_cached_regime() -> dict:
+    """Return current HMM regime, refreshing at most once every 5 minutes."""
+    import time
+    global _regime_cache, _regime_cache_ts
+    if time.monotonic() - _regime_cache_ts > _REGIME_TTL or not _regime_cache:
+        try:
+            from lib.regime_engine import get_current_regime
+            _regime_cache = get_current_regime()
+        except Exception:
+            _regime_cache = {'regime': '', 'error': 'regime_engine unavailable'}
+        _regime_cache_ts = time.monotonic()
+    return _regime_cache
+
 
 # ─────────────────────────────────────────────
 # SECTOR MAPPING
@@ -470,6 +489,45 @@ def grade_setup(ticker, regime, regime_confidence, composite_score, direction,
         points_intraday -= 15
         flags.append("Observe only — first 15 min")
 
+    # ─── HMM REGIME FINAL CALIBRATION ───────────────────────────────────────────
+    # Applied after all component scores are accumulated.
+    # Biases the final score toward/against the current macro environment.
+
+    _hmm          = _get_cached_regime()
+    _hmm_regime   = _hmm.get('regime', '')
+    _hmm_note     = ''
+
+    if _hmm_regime == 'Bull Quiet':
+        if direction == 'LONG':
+            points_intraday += 15
+            points_swing    += 15
+            _hmm_note = 'HMM: Bull Quiet +15 (Long aligned)'
+        else:
+            points_intraday -= 15
+            points_swing    -= 15
+            _hmm_note = 'HMM: Bull Quiet -15 (Short against regime)'
+
+    elif _hmm_regime == 'Bear Volatile':
+        if direction == 'SHORT':   # Puts — add conviction
+            points_intraday += 15
+            points_swing    += 15
+            _hmm_note = 'HMM: Bear Volatile +15 (Put aligned)'
+        else:                       # Calls — penalise
+            points_intraday -= 15
+            points_swing    -= 15
+            _hmm_note = 'HMM: Bear Volatile -15 (Call against regime)'
+
+    elif _hmm_regime == 'Chop':
+        # Hard ceiling: Chop market caps all setups at C-Grade (≤40)
+        points_intraday = min(points_intraday, 40)
+        points_swing    = min(points_swing, 40)
+        _hmm_note = 'HMM: Chop regime — scores capped at 40'
+        flags.append('Chop Regime — HMM cap active (max C-grade)')
+
+    if _hmm_note:
+        reasons_intraday.append(_hmm_note)
+        reasons_swing.append(_hmm_note)
+
     # ─── FINAL GRADING ───
 
     def assign_grade(points, flags_list, is_intraday=True):
@@ -582,28 +640,31 @@ def grade_setup(ticker, regime, regime_confidence, composite_score, direction,
 def build_ftfc_stack(ticker: str, mode: str = 'intraday') -> dict:
     """
     Build a multi-timeframe Full Timeframe Continuity stack.
-    mode='intraday': Monthly→Weekly→Daily→4H→65min→45min→15min (7 levels)
-    mode='swing':    Monthly→Weekly→Daily→4H (4 levels)
+    mode='intraday': Monthly → Weekly → Daily → 4H → 60min → 15min → 5min (7 levels)
+    mode='swing':    Monthly → Weekly → Daily → 4H (4 levels)
     Returns dict with stack list, consensus, confirmed, up/dn counts.
     """
-    from lib.data_client import get_daily, get_weekly, get_monthly, get_4h, get_65min, get_45min, get_15min
+    from lib.data_client import (
+        get_daily, get_weekly, get_monthly, get_4h,
+        get_60min, get_15min, get_5min,
+    )
 
     if mode == 'intraday':
         timeframe_fetchers = [
             ('Monthly', lambda: get_monthly(ticker)),
-            ('Weekly',  lambda: get_weekly(ticker, days=90)),
-            ('Daily',   lambda: get_daily(ticker, days=30)),
-            ('4H',      lambda: get_4h(ticker, days=30)),
-            ('65min',   lambda: get_65min(ticker, days=10)),
-            ('45min',   lambda: get_45min(ticker, days=7)),
-            ('15min',   lambda: get_15min(ticker, days=3)),
+            ('Weekly',  lambda: get_weekly(ticker,  days=90)),
+            ('Daily',   lambda: get_daily(ticker,   days=30)),
+            ('4H',      lambda: get_4h(ticker,      days=30)),
+            ('60min',   lambda: get_60min(ticker,   days=14)),
+            ('15min',   lambda: get_15min(ticker,   days=5)),
+            ('5min',    lambda: get_5min(ticker,    days=3)),
         ]
     else:
         timeframe_fetchers = [
             ('Monthly', lambda: get_monthly(ticker)),
             ('Weekly',  lambda: get_weekly(ticker, days=180)),
-            ('Daily',   lambda: get_daily(ticker, days=90)),
-            ('4H',      lambda: get_4h(ticker, days=60)),
+            ('Daily',   lambda: get_daily(ticker,  days=90)),
+            ('4H',      lambda: get_4h(ticker,     days=60)),
         ]
 
     stack = []

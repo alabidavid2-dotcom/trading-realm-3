@@ -15,8 +15,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from lib.scanner import (
-    run_full_scan, get_sp500_tickers,
+    run_full_scan, run_watchlist_scan, get_sp500_tickers,
     load_scan_history, save_scan_history, merge_scan_results,
+    generate_sparkline_base64,
 )
 from lib.notifier import (
     send_desktop_notification, format_scan_notification,
@@ -65,12 +66,35 @@ except ImportError:
 # ── Alpaca Executor (graceful fallback if keys not set) ────────────────────────
 EXECUTOR_AVAILABLE = False
 try:
-    from lib.executor import AlpacaExecutor, execute_signal, start_kill_switch_scheduler
+    from lib.executor import (
+        AlpacaExecutor, execute_signal, start_kill_switch_scheduler,
+        log_trade_to_supabase, log_trade_exit, fetch_trade_log,
+    )
     from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
     EXECUTOR_AVAILABLE = True
+    TRADE_LOG_AVAILABLE = True
 except Exception:
     ALPACA_API_KEY = ALPACA_SECRET_KEY = None
     ALPACA_PAPER = True
+    TRADE_LOG_AVAILABLE = False
+
+# ── Options sizing helpers (always available — pure math, no API) ──────────────
+try:
+    from lib.executor import build_trade_setup
+    TRADE_SETUP_AVAILABLE = True
+except Exception:
+    TRADE_SETUP_AVAILABLE = False
+
+# ── HMM Regime Engine ──────────────────────────────────────────────────────────
+try:
+    from lib.regime_engine import (
+        get_current_regime as _hmm_get_regime,
+        REGIME_META        as _REGIME_META,
+        model_exists       as _hmm_model_exists,
+    )
+    REGIME_ENGINE_AVAILABLE = True
+except Exception:
+    REGIME_ENGINE_AVAILABLE = False
 
 # ── Page Config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -294,10 +318,126 @@ st.markdown("""
         font-family: 'DM Sans', sans-serif; font-size: 12px; color: #fcd34d;
     }
 
+    /* ── Trading Cards (Pokémon-style) ── */
+    @keyframes alpha-border {
+        0%   { box-shadow: 0 0 10px 3px rgba(251,146,60,0.6), inset 0 1px 0 rgba(251,146,60,0.12); border-color: rgba(251,146,60,0.9); }
+        33%  { box-shadow: 0 0 20px 6px rgba(251,191,36,0.7), inset 0 1px 0 rgba(251,191,36,0.15); border-color: rgba(251,191,36,1.0); }
+        66%  { box-shadow: 0 0 14px 4px rgba(249,115,22,0.65), inset 0 1px 0 rgba(249,115,22,0.1); border-color: rgba(249,115,22,0.9); }
+        100% { box-shadow: 0 0 10px 3px rgba(251,146,60,0.6), inset 0 1px 0 rgba(251,146,60,0.12); border-color: rgba(251,146,60,0.9); }
+    }
+    .trade-card {
+        background: linear-gradient(165deg, #0c1016 0%, #111827 50%, #0c1016 100%);
+        border: 1.5px solid rgba(99,102,241,0.2);
+        border-radius: 15px; overflow: hidden; margin: 6px 0;
+        box-shadow: 0 10px 20px rgba(0,0,0,0.5), inset 0 0 0 5px rgba(255,255,255,0.05);
+        position: relative;
+        will-change: transform;
+        cursor: pointer;
+        aspect-ratio: 2.5 / 3.5;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+    }
+    .alpha-glow {
+        border-color: rgba(251,146,60,0.85);
+        background: linear-gradient(165deg, #0f0900 0%, #1a0f00 50%, #0c0800 100%);
+        animation: alpha-border 2.5s ease-in-out infinite;
+    }
+    /* Soft spotlight glare that tracks the cursor */
+    .tc-glare {
+        position: absolute; inset: 0; border-radius: 15px;
+        pointer-events: none; z-index: 20;
+        background: radial-gradient(
+            farthest-corner ellipse at var(--mx, 50%) var(--my, 50%),
+            rgba(255,255,255,0.30) 0%,
+            rgba(255,255,255,0.12) 28%,
+            transparent 58%
+        );
+        mix-blend-mode: screen;
+        opacity: 0;
+        transition: opacity 0.22s ease;
+    }
+    .trade-card:hover .tc-glare { opacity: 1; }
+    /* Rainbow foil — colour-dodge spectrum, Alpha holos only */
+    .tc-foil {
+        position: absolute; inset: 0; border-radius: 15px;
+        pointer-events: none; z-index: 19;
+        background: linear-gradient(
+            115deg,
+            transparent          0%,
+            rgba(255,0,120,0.20)  20%,
+            rgba(255,210,0,0.24)  36%,
+            rgba(0,255,90,0.20)   50%,
+            rgba(0,180,255,0.24)  64%,
+            rgba(200,0,255,0.20)  80%,
+            transparent         100%
+        );
+        background-size: 200% 200%;
+        background-position: var(--mx, 50%) var(--my, 50%);
+        mix-blend-mode: color-dodge;
+        opacity: 0;
+        transition: opacity 0.22s ease;
+    }
+    .alpha-glow:hover .tc-foil { opacity: 0.50; }
+    .tc-inner { padding: 14px 16px 12px 16px; }
+    .tc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
+    .tc-name { font-family: 'Syne', sans-serif; font-size: 21px; font-weight: 800; color: #e2e8f0; letter-spacing: -0.5px; line-height: 1; }
+    .tc-hp-col { text-align: right; flex-shrink: 0; padding-left: 8px; }
+    .tc-hp-num { font-family: 'DM Mono', monospace; font-size: 16px; font-weight: 700; line-height: 1; }
+    .tc-art-box { background: #07080d; border-radius: 8px; overflow: hidden; margin: 8px 0; border: 1px solid rgba(255,255,255,0.04); min-height: 72px; }
+    .tc-energy-row { display: flex; gap: 5px; align-items: flex-end; margin: 6px 0; flex-wrap: nowrap; }
+    .tc-energy-label { font-family: 'DM Mono', monospace; font-size: 9px; color: #374151; letter-spacing: 1px; min-width: 28px; padding-bottom: 3px; }
+    .tc-energy-dot { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+    .tc-moves { border-top: 1px solid rgba(255,255,255,0.04); border-bottom: 1px solid rgba(255,255,255,0.04); padding: 7px 0; margin: 7px 0; }
+    .tc-move-line { font-family: 'DM Mono', monospace; font-size: 11px; color: #94a3b8; padding: 2px 0; display: flex; align-items: center; gap: 6px; }
+    .tc-footer { display: flex; justify-content: space-between; align-items: center; padding-top: 4px; }
+    .tc-footer-tag { font-family: 'DM Mono', monospace; font-size: 9px; color: #374151; text-transform: uppercase; letter-spacing: 1.5px; }
+
+    /* ── Sparkline skeleton shimmer ── */
+    @keyframes tr-shimmer {
+        0%   { background-position: -200% 0; }
+        100% { background-position:  200% 0; }
+    }
+
     #MainMenu { visibility: hidden; }
     footer    { visibility: hidden; }
     header    { visibility: hidden; }
 </style>
+""", unsafe_allow_html=True)
+
+# ── Holographic tilt engine — injected once, MutationObserver keeps it live ──
+st.markdown("""
+<script>
+(function(){
+  function onMove(e){
+    var c=e.currentTarget,r=c.getBoundingClientRect();
+    var x=e.clientX-r.left, y=e.clientY-r.top;
+    var cx=r.width/2, cy=r.height/2;
+    var rx=((y-cy)/cy)*12, ry=((cx-x)/cx)*12;
+    var mx=(x/r.width)*100, my=(y/r.height)*100;
+    c.style.transform='perspective(700px) rotateX('+rx+'deg) rotateY('+ry+'deg) scale3d(1.03,1.03,1.03)';
+    var sh=(-ry*0.55)+'px '+(rx*0.55)+'px 28px rgba(0,0,0,0.55)';
+    if(c.classList.contains('alpha-glow')) sh+=', 0 0 32px rgba(251,146,60,0.5)';
+    c.style.boxShadow=sh;
+    c.style.setProperty('--mx',mx+'%');
+    c.style.setProperty('--my',my+'%');
+  }
+  function onLeave(e){
+    var c=e.currentTarget;
+    c.style.transform='';
+    c.style.boxShadow='';
+    c.style.setProperty('--mx','50%');
+    c.style.setProperty('--my','50%');
+  }
+  function bind(){
+    document.querySelectorAll('.trade-card').forEach(function(c){
+      if(!c._tr){c._tr=1;c.addEventListener('mousemove',onMove);c.addEventListener('mouseleave',onLeave);}
+    });
+  }
+  bind();
+  new MutationObserver(bind).observe(document.body,{childList:true,subtree:true});
+})();
+</script>
 """, unsafe_allow_html=True)
 
 
@@ -629,9 +769,11 @@ def render_account_bar():
 @st.cache_data(ttl=300)
 def run_single_analysis(ticker, days=730):
     from lib.data_client import get_daily
-    df = get_daily(ticker, days=days)
-    if df.empty:
-        return None
+    df = get_daily(ticker, days=max(days, 14))  # 14-day floor for weekend coverage
+    if df.empty or len(df) < 2:
+        # Raise — st.cache_data does NOT cache exceptions, so the next
+        # rerun will retry the Alpaca call instead of serving a stale None.
+        raise RuntimeError(f"No data returned for {ticker}")
 
     df['daily_return'] = df['Close'].pct_change()
     df['vol_20']       = df['daily_return'].rolling(20).std() * np.sqrt(252)
@@ -827,9 +969,23 @@ def run_single_analysis(ticker, days=730):
         'r_score': r_score, 'i_score': i_score, 's_score': int(s_score),
     }
 
+    # Gap and candlestick patterns (reuse the same df — no extra Alpaca call)
+    try:
+        from lib.data_client import detect_daily_gap, detect_candle_patterns
+        if not df.empty and len(df) >= 2:
+            gap_info    = detect_daily_gap(df)
+            candle_pats = detect_candle_patterns(df)
+        else:
+            gap_info    = {'gap_type': 'none', 'gap_pct': 0.0}
+            candle_pats = []
+    except Exception:
+        gap_info    = {'gap_type': 'none', 'gap_pct': 0.0}
+        candle_pats = []
+
     return {
         'df': df, 'regime': regime, 'regime_probs': regime_probs,
         'signal': signal, 'snap': snap, 'patterns': patterns,
+        'gap': gap_info, 'candle_patterns': candle_pats,
     }
 
 
@@ -914,15 +1070,17 @@ def build_candlestick_chart(df, ticker, show_days=120):
 if 'page' not in st.session_state:
     st.session_state.page = "ticker"
 
-nav_cols = st.columns([1, 1, 1, 1, 1, 1, 1])
+nav_cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1])
 pages = [
-    ("📊 Ticker",     "ticker"),
-    ("🎯 Scanner",    "scanner"),
-    ("📌 Tracker",    "tracker"),
-    ("💼 Trading",    "live"),
-    ("🚨 Alerts",     "orders"),
-    ("📜 Order Log",  "orderlog"),
-    ("📈 Backtest",   "backtest"),
+    ("📊 Ticker",      "ticker"),
+    ("🎯 Scanner",     "scanner"),
+    ("📌 Tracker",     "tracker"),
+    ("💼 Trading",     "live"),
+    ("🚨 Alerts",      "orders"),
+    ("📜 Order Log",   "orderlog"),
+    ("📈 Backtest",    "backtest"),
+    ("🏆 Performance", "performance"),
+    ("🗄️ DB",          "db_test"),
 ]
 for col, (label, key) in zip(nav_cols, pages):
     with col:
@@ -938,11 +1096,109 @@ page = st.session_state.page
 # ══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
+    # ── Admin authentication ──────────────────────────────────────────────────
+    admin_key = st.text_input("🔑 Admin Key", type="password", key="admin_key_input",
+                               placeholder="Enter key to unlock execution")
+    try:
+        _admin_pw = st.secrets.get("ADMIN_PASSWORD", "")
+    except Exception:
+        _admin_pw = ""
+    is_admin = bool(_admin_pw) and (admin_key == _admin_pw)
+    if is_admin:
+        st.success("Admin mode active", icon="✅")
+    elif admin_key:
+        st.error("Incorrect key", icon="❌")
+    else:
+        st.markdown(
+            '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.15);'
+            'border-radius:8px;padding:6px 12px;font-family:DM Mono,monospace;'
+            'font-size:10px;color:#475569;text-align:center;margin-bottom:4px;">'
+            '👁️ View-Only Mode — enter key to unlock</div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown("---")
+
     # ── Show help guide if active, otherwise show settings ───────────────────
     if st.session_state.get('show_help') and st.session_state.get('help_tab'):
         render_help_sidebar(st.session_state.help_tab)
     else:
-        st.markdown("## ⚙️ Settings")
+        # ── Market Mood (HMM Regime) ──────────────────────────────────────────────
+        if REGIME_ENGINE_AVAILABLE and _hmm_model_exists():
+            if 'sidebar_regime' not in st.session_state:
+                st.session_state.sidebar_regime = None
+            if st.session_state.sidebar_regime is None:
+                try:
+                    st.session_state.sidebar_regime = _hmm_get_regime()
+                except Exception:
+                    st.session_state.sidebar_regime = {}
+
+            _sr = st.session_state.sidebar_regime or {}
+            _sr_regime  = _sr.get('regime', 'Unknown')
+            _sr_conf    = _sr.get('confidence', 0.0)
+            _sr_meta    = _sr.get('meta') or _REGIME_META.get(_sr_regime, {})
+            _sr_bias    = _sr_meta.get('bias', 'FLAT')
+            _sr_color   = _sr_meta.get('color', '#6b7280')
+            _sr_bg      = _sr_meta.get('bg', '#1f2937')
+            _sr_sizing  = _sr_meta.get('sizing', '—')
+            _sr_spy     = _sr.get('spy_close')
+            _sr_bias_arrow = '▲' if _sr_bias == 'LONG' else ('▼' if _sr_bias == 'SHORT' else '—')
+            _sr_bias_clr   = '#4ade80' if _sr_bias == 'LONG' else ('#f87171' if _sr_bias == 'SHORT' else '#f59e0b')
+
+            # Confidence bar fill
+            _sr_conf_fill = max(0, min(100, _sr_conf))
+            _sr_conf_color = '#22c55e' if _sr_conf >= 70 else ('#f59e0b' if _sr_conf >= 45 else '#ef4444')
+
+            _sr_spy_html = (
+                f'<div style="font-size:10px;color:#4b5563;font-family:DM Mono,monospace;">SPY ${_sr_spy}</div>'
+                if _sr_spy else ''
+            )
+            _sr_sizing_safe = _sr_sizing.replace("'", "&#39;")
+            st.markdown(
+                f'<div style="background:{_sr_bg};border:1px solid {_sr_color}44;border-radius:14px;'
+                f'padding:14px 16px;margin-bottom:12px;">'
+                f'<div style="font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:2px;'
+                f'font-family:DM Sans,sans-serif;margin-bottom:8px;">Market Mood</div>'
+                f'<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px;">'
+                f'<span style="font-family:Syne,sans-serif;font-size:16px;font-weight:700;'
+                f'color:{_sr_color};">{_sr_regime}</span>'
+                f'<span style="font-family:DM Mono,monospace;font-size:20px;font-weight:700;'
+                f'color:{_sr_bias_clr};">{_sr_bias_arrow}</span>'
+                f'</div>'
+                f'<div style="margin-bottom:8px;">'
+                f'<div style="font-size:9px;color:#4b5563;margin-bottom:3px;font-family:DM Sans,sans-serif;">Confidence</div>'
+                f'<div style="background:#111827;border-radius:3px;height:5px;overflow:hidden;">'
+                f'<div style="width:{_sr_conf_fill}%;height:100%;background:{_sr_conf_color};border-radius:3px;"></div>'
+                f'</div>'
+                f'<div style="font-size:10px;color:{_sr_conf_color};margin-top:2px;font-family:DM Mono,monospace;">{_sr_conf:.1f}%</div>'
+                f'</div>'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                f'<div style="font-size:10px;color:#4b5563;font-family:DM Sans,sans-serif;">'
+                f'Bias: <span style="color:{_sr_bias_clr};font-weight:600;">{_sr_bias}</span></div>'
+                f'{_sr_spy_html}'
+                f'</div>'
+                f'<div style="margin-top:6px;font-size:9px;color:#374151;font-family:DM Sans,sans-serif;'
+                f'line-height:1.4;">{_sr_sizing_safe}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Refresh Regime", key="refresh_regime_sidebar", use_container_width=True):
+                try:
+                    st.session_state.sidebar_regime = _hmm_get_regime()
+                    st.rerun()
+                except Exception as _re:
+                    st.error(f"Regime refresh failed: {_re}")
+
+        elif REGIME_ENGINE_AVAILABLE and not _hmm_model_exists():
+            st.markdown("""
+<div style="background:#1c1508;border:1px solid rgba(251,191,36,0.3);border-radius:12px;
+    padding:12px 14px;margin-bottom:12px;">
+  <div style="font-size:10px;color:#f59e0b;font-family:'DM Sans',sans-serif;">
+    HMM Model not trained.<br>Run <code>python train_hmm.py</code> to activate the Market Mood.
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("## Settings")
 
         ticker     = st.selectbox("Ticker",
             ['SPY','QQQ','IWM','NVDA','AAPL','TSLA','MU','WMT','UNH','ELF','GM','AMD','AMZN','META','GOOGL'], index=0)
@@ -1001,6 +1257,23 @@ with st.sidebar:
             </div>
         </div>
         """, unsafe_allow_html=True)
+
+        # ── Auth Debug (temporary — remove once 401 resolved) ─────────────────
+        try:
+            from lib.data_client import get_auth_debug_info
+            _dbg = get_auth_debug_info()
+            if _dbg:
+                _env_icon = '📄' if _dbg.get('environment') == 'PAPER' else '💰'
+                st.sidebar.info(
+                    f"**🔑 Alpaca Auth Debug**\n\n"
+                    f"API key ends: `…{_dbg['key_last4']}` ({_dbg['key_len']} chars)\n\n"
+                    f"Secret ends:  `…{_dbg['sec_last4']}` ({_dbg['sec_len']} chars)\n\n"
+                    f"{_env_icon} Environment: **{_dbg['environment']}**\n\n"
+                    f"Broker URL: `{_dbg['trading_url']}`\n\n"
+                    f"Data URL:   `{_dbg['data_url']}`"
+                )
+        except Exception:
+            pass
 
         # ── Psychology pre-trade check ─────────────────────────────────────────
         st.markdown("### 🧠 Mindset Check")
@@ -1123,59 +1396,223 @@ def render_daily_loss_gate():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if page == "ticker":
-    with st.spinner(f"Analyzing {ticker}..."):
-        data = run_single_analysis(ticker, days=train_days)
-
-    if data is None:
-        st.error(f"No data for {ticker}"); st.stop()
-
-    regime   = data['regime']
-    signal   = data['signal']
-    snap     = data['snap']
-    patterns = data['patterns']
-
     show_tab_header("ticker", f"📊 {ticker}", datetime.now().strftime('%B %d, %Y'))
     render_daily_loss_gate()
+
+    # ── Live Quote Search ──────────────────────────────────────────────────────
+    st.markdown("<div class='section-header'>Live Quote</div>", unsafe_allow_html=True)
+
+    from lib.data_client import get_live_quote
+    from datetime import timezone as _tz
+
+    with st.form("live_quote_form", clear_on_submit=False):
+        _lq_c1, _lq_c2 = st.columns([6, 1])
+        with _lq_c1:
+            _lq_input = st.text_input(
+                "lq_search",
+                value=st.session_state.get("lq_ticker", ticker),
+                placeholder="Enter any ticker — SPY, NVDA, AAPL, QQQ, TSLA...",
+                label_visibility="collapsed",
+            )
+        with _lq_c2:
+            _lq_go = st.form_submit_button("Search", use_container_width=True, type="primary")
+
+    if _lq_go and _lq_input.strip():
+        st.session_state.lq_ticker = _lq_input.strip().upper()
+
+    _lq_sym = st.session_state.get("lq_ticker", ticker)
+
+    get_live_quote._last_error = None   # reset before each call
+    with st.spinner(f"Fetching {_lq_sym}..."):
+        _quote = get_live_quote(_lq_sym)
+
+    if _quote is None:
+        # Snapshot failed (common on weekends with IEX) — fall back to last daily bar
+        _lq_err = getattr(get_live_quote, '_last_error', None)
+        try:
+            from lib.data_client import get_daily as _gd
+            _fb_df = _gd(_lq_sym, days=5)
+            if not _fb_df.empty and len(_fb_df) >= 2:
+                _fb_close  = float(_fb_df['Close'].iloc[-1])
+                _fb_prev   = float(_fb_df['Close'].iloc[-2])
+                _fb_chg    = _fb_close - _fb_prev
+                _fb_chgpct = (_fb_chg / _fb_prev * 100) if _fb_prev else 0.0
+                _quote = {
+                    "ticker":          _lq_sym,
+                    "price":           round(_fb_close, 2),
+                    "change_pct":      round(_fb_chgpct, 2),
+                    "change_dollar":   round(_fb_chg, 2),
+                    "prev_close":      round(_fb_prev, 2),
+                    "last_trade_time": None,   # signals market-closed path below
+                    "_fallback":       True,
+                }
+            else:
+                _quote = None
+        except Exception:
+            _quote = None
+
+        if _quote is None:
+            if _lq_err:
+                st.error(f"Alpaca snapshot error — {_lq_err}")
+            st.warning(
+                f"⚠️ **{_lq_sym}** — no price data available. "
+                "Ticker may be invalid or API keys incorrect."
+            )
+
+    if _quote is not None:
+        _price   = _quote["price"]
+        _chg_pct = _quote["change_pct"]
+        _chg_dol = _quote["change_dollar"]
+        _prev    = _quote["prev_close"]
+        _is_up   = (_chg_pct or 0) >= 0
+        _clr     = "#22c55e" if _is_up else "#ef4444"
+        _arrow   = "▲" if _is_up else "▼"
+        _sign    = "+" if _is_up else ""
+
+        _chg_pct_str = f"{_sign}{_chg_pct:.2f}%" if _chg_pct is not None else "—"
+        _chg_dol_str = f"{_sign}${abs(_chg_dol):.2f}" if _chg_dol is not None else "—"
+        _prev_str    = f"${_prev:,.2f}" if _prev else "—"
+
+        # Detect market-closed — fallback path or stale last_trade_time
+        _ltt = _quote.get("last_trade_time")
+        if _quote.get("_fallback"):
+            _feed_label = "Market Closed · Last Daily Close (Alpaca)"
+        elif _ltt:
+            try:
+                _age_h = (datetime.now(_tz.utc) - _ltt).total_seconds() / 3600
+                _feed_label = "Market Closed · Last Session Price" if _age_h > 18 else "IEX · 15-min delayed"
+            except Exception:
+                _feed_label = "IEX · 15-min delayed"
+        else:
+            _feed_label = "IEX · 15-min delayed"
+
+        _border_clr = "34,197,94" if _is_up else "239,68,68"
+        _lqm1, _lqm2, _lqm3 = st.columns(3)
+        with _lqm1:
+            st.markdown(f"""
+            <div class="metric-card" style="border-color:rgba({_border_clr},0.35);">
+                <div class="metric-label">{_quote['ticker']} — Last Price</div>
+                <div class="metric-value" style="font-size:34px;color:#e2e8f0;">${_price:,.2f}</div>
+                <div class="metric-sub" style="color:#4b5563;">{_feed_label}</div>
+            </div>""", unsafe_allow_html=True)
+        with _lqm2:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-label">Daily Change</div>
+                <div class="metric-value" style="font-size:28px;color:{_clr};">{_arrow} {_chg_pct_str}</div>
+                <div class="metric-sub" style="color:{_clr};">{_chg_dol_str} vs prev close</div>
+            </div>""", unsafe_allow_html=True)
+        with _lqm3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-label">Prev Close</div>
+                <div class="metric-value" style="font-size:28px;color:#94a3b8;">{_prev_str}</div>
+                <div class="metric-sub">Previous session close</div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Full Analysis (HMM + signals) ─────────────────────────────────────────
+    with st.spinner(f"Analyzing {ticker}..."):
+        try:
+            data = run_single_analysis(ticker, days=train_days)
+        except Exception as _analysis_err:
+            data = None
+            st.warning(
+                f"⚠️ **{ticker}** — Alpaca returned no daily bars. "
+                "Market may be closed; data reflects the most recent trading session. "
+                f"({_analysis_err})"
+            )
+
+    if data is None:
+        st.stop()
+
+    regime        = data['regime']
+    signal        = data['signal']
+    snap          = data['snap']
+    patterns      = data['patterns']
+    gap_info      = data.get('gap', {'gap_type': 'none', 'gap_pct': 0.0})
+    candle_pats   = data.get('candle_patterns', [])
+
+    _gap_type = gap_info.get('gap_type', 'none')
+    _gap_pct  = gap_info.get('gap_pct', 0.0)
+
+    # Build "Setup:" line — gap label + candle pattern names, shown inside signal card
+    _setup_parts = []
+    if _gap_type != 'none':
+        _gap_dir_word = 'Gap Up' if 'up' in _gap_type else 'Gap Down'
+        _gap_strength_word = 'Strong' if 'strong' in _gap_type else 'Moderate'
+        _setup_parts.append(f"{_gap_strength_word} {_gap_dir_word} {_gap_pct:+.1f}%")
+    for _cp in candle_pats:
+        _cp_arrow = '↑' if _cp.get('direction') == 'up' else ('↓' if _cp.get('direction') == 'down' else '')
+        _setup_parts.append(f"{_cp['name']} {_cp_arrow}".strip())
+    _setup_line = ' · '.join(_setup_parts) if _setup_parts else '—'
+
+    # Determine if a favorable gap/pattern boosts an A grade to A+
+    _bullish_boost = (
+        (signal['direction'] == 'LONG' and _gap_type in ('strong_up', 'moderate_up')) or
+        (signal['direction'] == 'SHORT' and _gap_type in ('strong_down', 'moderate_down')) or
+        any(
+            (cp.get('name') in ('Bullish Engulfing',) and cp.get('direction') == 'up' and signal['direction'] == 'LONG') or
+            (cp.get('name') in ('Bearish Engulfing',) and cp.get('direction') == 'down' and signal['direction'] == 'SHORT')
+            for cp in candle_pats
+        )
+    )
 
     c1, c2, c3 = st.columns([2, 2, 3])
     with c1:
         sc = 'signal-long' if signal['direction']=='LONG' else ('signal-short' if signal['direction']=='SHORT' else 'signal-flat')
+        _setup_color = '#4ade80' if ('up' in _gap_type or any(c.get('direction')=='up' for c in candle_pats)) else ('#f87171' if ('down' in _gap_type or any(c.get('direction')=='down' for c in candle_pats)) else '#94a3b8')
         st.markdown(f"""
         <div class="signal-card {sc}">
             <div class="signal-label">Signal</div>
             <div class="signal-value">{signal['trade_type']}</div>
             <div class="signal-sub">{signal['strength']} | Score: {signal['composite']:+d}</div>
+            <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);
+                font-size:11px;font-family:'DM Mono',monospace;">
+                <span style="color:#6b7280;">Setup: </span>
+                <span style="color:{_setup_color};">{_setup_line}</span>
+            </div>
         </div>""", unsafe_allow_html=True)
 
         # Execute button for A+/A grades on single ticker
         if EXECUTOR_AVAILABLE and is_executable_grade(signal.get('strength','')) and signal['direction'] != 'FLAT':
-            exe_key = f"exec_ticker_{ticker}"
-            if st.button(f"⚡ EXECUTE ON ALPACA", key=exe_key, type="primary", use_container_width=True):
-                st.session_state[f"confirm_{exe_key}"] = True
+            if is_admin:
+                exe_key = f"exec_ticker_{ticker}"
+                if st.button(f"⚡ EXECUTE ON ALPACA", key=exe_key, type="primary", use_container_width=True):
+                    st.session_state[f"confirm_{exe_key}"] = True
 
-            if st.session_state.get(f"confirm_{exe_key}"):
-                st.warning(f"⚠️ Confirm paper trade: {signal['direction']} {ticker} @ ~${snap['close']:.2f}")
-                col_y, col_n = st.columns(2)
-                with col_y:
-                    if st.button("✅ YES, EXECUTE", key=f"yes_{exe_key}", type="primary"):
-                        exe = get_executor()
-                        result = exe.submit_equity_order(
-                            symbol=ticker,
-                            side='buy' if signal['direction']=='LONG' else 'sell',
-                            price=snap['close'],
-                            regime=regime,
-                            trade_type='0DTE' if '0DTE' in signal['trade_type'] else 'swing',
-                            grade='A',
-                        )
-                        if result:
-                            log_order(result)
-                            st.success(f"✅ Order submitted! ID: {result['order_id'][:8]}...")
-                        else:
-                            st.error("❌ Order blocked by session/regime rules.")
-                        st.session_state[f"confirm_{exe_key}"] = False
-                with col_n:
-                    if st.button("❌ Cancel", key=f"no_{exe_key}"):
-                        st.session_state[f"confirm_{exe_key}"] = False
+                if st.session_state.get(f"confirm_{exe_key}"):
+                    st.warning(f"⚠️ Confirm paper trade: {signal['direction']} {ticker} @ ~${snap['close']:.2f}")
+                    col_y, col_n = st.columns(2)
+                    with col_y:
+                        if st.button("✅ YES, EXECUTE", key=f"yes_{exe_key}", type="primary"):
+                            exe = get_executor()
+                            result = exe.submit_equity_order(
+                                symbol=ticker,
+                                side='buy' if signal['direction']=='LONG' else 'sell',
+                                price=snap['close'],
+                                regime=regime,
+                                trade_type='0DTE' if '0DTE' in signal['trade_type'] else 'swing',
+                                grade='A',
+                            )
+                            if result:
+                                log_order(result)
+                                st.success(f"✅ Order submitted! ID: {result['order_id'][:8]}...")
+                            else:
+                                st.error("❌ Order blocked by session/regime rules.")
+                            st.session_state[f"confirm_{exe_key}"] = False
+                    with col_n:
+                        if st.button("❌ Cancel", key=f"no_{exe_key}"):
+                            st.session_state[f"confirm_{exe_key}"] = False
+            else:
+                st.markdown(
+                    '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
+                    'border-radius:8px;padding:8px 14px;font-family:DM Mono,monospace;'
+                    'font-size:11px;color:#374151;text-align:center;margin-top:6px;">'
+                    '🔒 Execution Disabled — Read-Only Mode</div>',
+                    unsafe_allow_html=True,
+                )
 
     with c2:
         rc = regime.lower().replace(' ','_')
@@ -1211,54 +1648,208 @@ if page == "ticker":
     fig = build_candlestick_chart(data['df'], ticker, show_days=chart_days)
     st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
-    st.markdown("<div class='section-header'>Indicators</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='section-header'>Indicators "
+        "<span style='font-size:10px;color:#334155;font-family:\"DM Mono\",monospace;"
+        "background:#1e293b;border-radius:4px;padding:2px 7px;vertical-align:middle;"
+        "margin-left:6px;'>Alpaca IEX</span></div>",
+        unsafe_allow_html=True,
+    )
     ic       = st.columns(6)
     ind_data = [
-        ("RSI",      f"{snap['rsi']:.0f}",       "metric-positive" if 40<snap['rsi']<70 else "metric-negative", ""),
-        ("ADX",      f"{snap['adx']:.0f}",        "metric-positive" if snap['adx']>25 else "", f"{'↑ Rising' if snap['adx_rising'] else '↓ Falling'}"),
-        ("MACD",     f"{snap['macd_hist']:.3f}",  "metric-positive" if snap['macd_hist']>0 else "metric-negative", ""),
+        ("RSI",      f"{snap['rsi']:.0f}",       "metric-positive" if 40<snap['rsi']<70 else "metric-negative",
+         "Overbought" if snap['rsi']>70 else ("Oversold" if snap['rsi']<30 else "")),
+        ("ADX",      f"{snap['adx']:.0f}",        "metric-positive" if snap['adx']>25 else "",
+         f"{'↑ Rising' if snap['adx_rising'] else '↓ Falling'}"),
+        ("MACD",     f"{snap['macd_hist']:.3f}",  "metric-positive" if snap['macd_hist']>0 else "metric-negative",
+         "Cross ↑" if snap['macd_cross_up'] else ("Cross ↓" if snap['macd_cross_down'] else "")),
         ("Momentum", f"{snap['momentum']:.1f}%",  "metric-positive" if snap['momentum']>0 else "metric-negative", ""),
-        ("BB %",     f"{snap['bb_pct']:.2f}",     "", f"{'🔥 Squeeze' if snap['bb_squeeze'] else ''}"),
-        ("Volume",   f"{snap['vol_ratio']:.1f}x", "metric-positive" if snap['vol_ratio']>1.5 else "", f"{'High' if snap['high_volume'] else 'Normal'}"),
+        ("BB %",     f"{snap['bb_pct']:.2f}",     "", f"{'Squeeze' if snap['bb_squeeze'] else ''}"),
+        ("Volume",   f"{snap['vol_ratio']:.1f}x", "metric-positive" if snap['vol_ratio']>1.5 else "",
+         f"{'High' if snap['high_volume'] else 'Normal'}"),
     ]
     for col, (label, val, css, sub) in zip(ic, ind_data):
         with col:
             st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value {css}">{val}</div><div class="metric-sub">{sub}</div></div>', unsafe_allow_html=True)
 
-    # ── FTFC Stack ────────────────────────────────────────────────────────────
-    try:
-        from lib.trade_grader import build_ftfc_stack
-        with st.expander("🏗️ Full Timeframe Continuity (FTFC) Stack", expanded=False):
-            ftfc_mode = st.radio("Mode", ["intraday", "swing"], horizontal=True, key="ftfc_mode_ticker")
-            with st.spinner("Fetching timeframe data..."):
-                ftfc = build_ftfc_stack(ticker, mode=ftfc_mode)
-            consensus_color = '#22c55e' if 'bull' in ftfc['consensus'] else ('#ef4444' if 'bear' in ftfc['consensus'] else '#94a3b8')
+    # ── Full Trade Grade (uses pre-fetched df — no extra Alpaca call) ─────────
+    with st.expander("🎯 Full Trade Grade (A+ / A / B / C / NO TRADE)", expanded=True):
+        with st.spinner("Grading setup..."):
+            try:
+                from lib.trade_grader import grade_ticker_full
+                full_grade = grade_ticker_full(
+                    ticker=ticker,
+                    regime=regime,
+                    regime_confidence=signal['confidence'],
+                    composite_score=signal['composite'],
+                    direction=signal['direction'] if signal['direction'] != 'FLAT' else 'LONG',
+                    indicators=snap,
+                    strat_patterns=patterns,
+                    df=data['df'],   # reuse the already-fetched daily DataFrame
+                )
+            except Exception as _ge:
+                full_grade = None
+                st.error(f"Grade engine error: {_ge}")
+
+        if full_grade:
+            _gi = full_grade.get('grade_intraday', '—')
+            _gs = full_grade.get('grade_swing', '—')
+            _ti = full_grade.get('trade_intraday', '—')
+            _ts = full_grade.get('trade_swing', '—')
+            _ri = full_grade.get('risk_0dte', 0)
+            _rs = full_grade.get('risk_swing', 0)
+            _ci = full_grade.get('contracts_0dte', 2)
+            _cs = full_grade.get('contracts_swing', 2)
+            _pi = full_grade.get('points_intraday', 0)
+            _ps = full_grade.get('points_swing', 0)
+            _strike = full_grade.get('strike_note', '')
+            _swing_strike = full_grade.get('swing_strike_note', '')
+            _flags = full_grade.get('flags', [])
+            _ftc   = full_grade.get('ftc', {})
+            _sec   = full_grade.get('sector_corr', {})
+            _atr_g = full_grade.get('atr', {})
+
+            # A → A+ UI boost when a favorable gap/engulfing pattern confirms the trade
+            _boost_label = ''
+            if _bullish_boost:
+                if _gi == 'A':
+                    _gi = 'A+'
+                    _boost_label = 'Gap & Go' if _gap_type != 'none' else 'Engulfing Conf.'
+                if _gs == 'A':
+                    _gs = 'A+'
+                    _boost_label = _boost_label or ('Gap & Go' if _gap_type != 'none' else 'Engulfing Conf.')
+
+            _grade_colors = {'A+': '#22c55e', 'A': '#86efac', 'B': '#fbbf24', 'C': '#f97316', 'NO_TRADE': '#6b7280'}
+            _gi_color = _grade_colors.get(_gi, '#94a3b8')
+            _gs_color = _grade_colors.get(_gs, '#94a3b8')
+
+            gc1, gc2 = st.columns(2)
+            with gc1:
+                _boost_badge = f'<div style="display:inline-block;background:#14532d;color:#4ade80;border-radius:5px;padding:2px 8px;font-size:10px;font-family:\'DM Mono\',monospace;margin-top:6px;">⬆ {_boost_label}</div>' if _boost_label else ''
+                st.markdown(f"""
+                <div style="background:rgba(255,255,255,0.03);border:1px solid {_gi_color}55;
+                    border-radius:12px;padding:16px 20px;">
+                    <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;letter-spacing:1px;margin-bottom:6px;">INTRADAY (0DTE)</div>
+                    <div style="font-size:36px;font-weight:800;color:{_gi_color};font-family:'JetBrains Mono',monospace;">{_gi}</div>
+                    <div style="font-size:13px;color:#94a3b8;margin:4px 0;">{_ti} &nbsp;|&nbsp; {_pi} pts</div>
+                    <div style="font-size:12px;color:#64748b;">Risk: ${_ri} &nbsp;·&nbsp; {_ci} contracts</div>
+                    {_boost_badge}
+                    {f'<div style="font-size:11px;color:#94a3b8;margin-top:6px;font-style:italic;">{_strike}</div>' if _strike else ''}
+                </div>""", unsafe_allow_html=True)
+            with gc2:
+                st.markdown(f"""
+                <div style="background:rgba(255,255,255,0.03);border:1px solid {_gs_color}55;
+                    border-radius:12px;padding:16px 20px;">
+                    <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;letter-spacing:1px;margin-bottom:6px;">SWING</div>
+                    <div style="font-size:36px;font-weight:800;color:{_gs_color};font-family:'JetBrains Mono',monospace;">{_gs}</div>
+                    <div style="font-size:13px;color:#94a3b8;margin:4px 0;">{_ts} &nbsp;|&nbsp; {_ps} pts</div>
+                    <div style="font-size:12px;color:#64748b;">Risk: ${_rs} &nbsp;·&nbsp; {_cs} contracts</div>
+                    {f'<div style="font-size:11px;color:#94a3b8;margin-top:6px;font-style:italic;">{_swing_strike}</div>' if _swing_strike else ''}
+                </div>""", unsafe_allow_html=True)
+
+            # ── Grade components ──────────────────────────────────────────────
+            _ftc_txt  = f"{_ftc.get('aligned',0)}/{_ftc.get('total',0)} {'✅' if _ftc.get('ftc_confirmed') else '⚠️'} ({_ftc.get('direction','—')})" if _ftc else '—'
+            _sec_txt  = f"{_sec.get('sector','—')} {'✅' if _sec.get('correlated') else '❌'} ({_sec.get('score',0)}/3)" if _sec else '—'
+            _atr_txt  = _atr_g.get('move_potential', '—') if _atr_g else '—'
+
+            st.markdown("<div style='margin-top:14px;display:flex;gap:12px;flex-wrap:wrap;'>", unsafe_allow_html=True)
             st.markdown(f"""
-            <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">
-                <span style="font-family:'DM Mono',monospace;font-size:14px;font-weight:700;color:{consensus_color};">
-                    {ftfc['consensus'].upper()}
-                </span>
-                <span style="font-size:12px;color:#6b7280;">
-                    {ftfc['up_count']}↑ {ftfc['dn_count']}↓ / {ftfc['total']} TFs
-                    {'✅ CONFIRMED' if ftfc['confirmed'] else ''}
-                </span>
-            </div>
-            """, unsafe_allow_html=True)
-            cols = st.columns(len(ftfc['stack']))
-            for col, s in zip(cols, ftfc['stack']):
-                color = '#22c55e' if s['direction']=='up' else ('#ef4444' if s['direction']=='down' else '#6b7280')
-                arrow = '↑' if s['direction']=='up' else ('↓' if s['direction']=='down' else '—')
-                with col:
-                    st.markdown(f"""
-                    <div style="text-align:center;background:#0f1117;border:1px solid {color}44;
-                        border-radius:8px;padding:8px 4px;">
-                        <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;">{s['tf']}</div>
-                        <div style="font-size:20px;color:{color};">{arrow}</div>
-                        <div style="font-size:9px;color:#4b5563;">${s['close'] or '—'}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-    except Exception:
-        pass
+            <div style="margin-top:14px;display:flex;gap:12px;flex-wrap:wrap;">
+                <div style="background:rgba(255,255,255,0.03);border:1px solid #334155;border-radius:8px;padding:10px 14px;min-width:140px;">
+                    <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;">FTC</div>
+                    <div style="font-size:12px;color:#e2e8f0;margin-top:4px;">{_ftc_txt}</div>
+                </div>
+                <div style="background:rgba(255,255,255,0.03);border:1px solid #334155;border-radius:8px;padding:10px 14px;min-width:140px;">
+                    <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;">Sector</div>
+                    <div style="font-size:12px;color:#e2e8f0;margin-top:4px;">{_sec_txt}</div>
+                </div>
+                <div style="background:rgba(255,255,255,0.03);border:1px solid #334155;border-radius:8px;padding:10px 14px;min-width:140px;">
+                    <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;">ATR Room</div>
+                    <div style="font-size:12px;color:#e2e8f0;margin-top:4px;">{_atr_txt}</div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            if _flags:
+                st.markdown("<div style='margin-top:10px;'>", unsafe_allow_html=True)
+                for fl in _flags:
+                    st.markdown(f"<div style='font-size:12px;color:#f59e0b;font-family:\"DM Mono\",monospace;'>⚠ {fl}</div>", unsafe_allow_html=True)
+
+            # Grade reasons
+            _reasons_i = full_grade.get('reasons_intraday', [])
+            _reasons_s = full_grade.get('reasons_swing', [])
+            if _reasons_i or _reasons_s:
+                with st.expander("Grade reasoning", expanded=False):
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        st.markdown("**Intraday**")
+                        for rr in _reasons_i:
+                            st.markdown(f"<div style='font-size:12px;color:#94a3b8;'>+ {rr}</div>", unsafe_allow_html=True)
+                    with rc2:
+                        st.markdown("**Swing**")
+                        for rr in _reasons_s:
+                            st.markdown(f"<div style='font-size:12px;color:#94a3b8;'>+ {rr}</div>", unsafe_allow_html=True)
+
+    # ── FTFC Stack ────────────────────────────────────────────────────────────
+    # Import must come BEFORE any attribute access on the function object.
+    from lib.data_client import get_ftfc_snapshot
+
+    with st.expander("🏗️ Full Timeframe Continuity (FTFC) Stack", expanded=False):
+        ftfc_mode = st.radio("Mode", ["intraday", "swing"], horizontal=True, key="ftfc_mode_ticker")
+        get_ftfc_snapshot._last_errors = []   # reset error list before each fetch
+        with st.spinner("Fetching timeframe data from Alpaca..."):
+            ftfc_stack = get_ftfc_snapshot(ticker, mode=ftfc_mode)
+
+        _ftfc_errors = getattr(get_ftfc_snapshot, '_last_errors', [])
+        if _ftfc_errors:
+            with st.expander("⚠️ Timeframe fetch errors (debug)", expanded=False):
+                for _err in _ftfc_errors:
+                    st.error(_err)
+
+        # ── Consensus header ──────────────────────────────────────────────
+        dirs    = [s['direction'] for s in ftfc_stack if s['direction'] != 'neutral']
+        up_cnt  = sum(1 for d in dirs if d == 'up')
+        dn_cnt  = sum(1 for d in dirs if d == 'down')
+        total   = len(dirs)
+        if total == 0:          consensus = 'NEUTRAL'
+        elif up_cnt == total:   consensus = 'BULLISH ✅'
+        elif dn_cnt == total:   consensus = 'BEARISH ✅'
+        elif up_cnt / total >= 0.75: consensus = 'LEANING BULL'
+        elif dn_cnt / total >= 0.75: consensus = 'LEANING BEAR'
+        else:                   consensus = 'MIXED'
+
+        con_color = '#22c55e' if 'BULL' in consensus else ('#ef4444' if 'BEAR' in consensus else '#94a3b8')
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:12px;margin-bottom:14px;'>"
+            f"<span style='font-family:\"DM Mono\",monospace;font-size:15px;font-weight:700;color:{con_color};'>{consensus}</span>"
+            f"<span style='font-size:12px;color:#6b7280;'>{up_cnt}↑ &nbsp; {dn_cnt}↓ &nbsp;/&nbsp; {total} timeframes</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # ── Per-timeframe cards ───────────────────────────────────────────
+        cols = st.columns(len(ftfc_stack))
+        for col, s in zip(cols, ftfc_stack):
+            is_up    = s['direction'] == 'up'
+            is_down  = s['direction'] == 'down'
+            color    = '#22c55e' if is_up else ('#ef4444' if is_down else '#6b7280')
+            bg       = 'rgba(34,197,94,0.06)' if is_up else ('rgba(239,68,68,0.06)' if is_down else 'rgba(255,255,255,0.02)')
+            arrow    = '↑' if is_up else ('↓' if is_down else '—')
+            sign     = '+' if is_up else ''
+            chg_str  = f"{sign}{s['change_pct']:.2f}%" if s['change_pct'] is not None else '—'
+            open_str  = f"${s['open']:,.2f}"  if s['open']  is not None else '—'
+            close_str = f"${s['close']:,.2f}" if s['close'] is not None else '—'
+            with col:
+                st.markdown(f"""
+                <div style="text-align:center;background:{bg};
+                    border:1px solid {color}55;border-radius:10px;padding:10px 4px;">
+                    <div style="font-size:10px;color:#6b7280;font-family:'DM Mono',monospace;
+                        letter-spacing:0.5px;margin-bottom:4px;">{s['tf']}</div>
+                    <div style="font-size:22px;color:{color};font-weight:700;line-height:1;">{arrow}</div>
+                    <div style="font-size:10px;color:{color};font-weight:600;margin:3px 0;">{chg_str}</div>
+                    <div style="font-size:9px;color:#94a3b8;font-family:'DM Mono',monospace;">O {open_str}</div>
+                    <div style="font-size:9px;color:#e2e8f0;font-family:'DM Mono',monospace;">C {close_str}</div>
+                </div>
+                """, unsafe_allow_html=True)
 
 
     st.markdown("<div class='section-header' style='margin-top:24px;'>Signal Breakdown</div>", unsafe_allow_html=True)
@@ -1287,11 +1878,28 @@ elif page == "scanner":
     if 'last_scan_results' not in st.session_state: st.session_state.last_scan_results = None
     if 'play_sound'        not in st.session_state: st.session_state.play_sound        = False
 
-    col_btn1, col_btn2, col_info = st.columns([1, 1, 3])
+    if 'fast_scan_results' not in st.session_state: st.session_state.fast_scan_results = None
+
+    _RO = ('<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
+           'border-radius:8px;padding:7px 10px;font-family:DM Mono,monospace;'
+           'font-size:10px;color:#374151;text-align:center;">🔒 Read-Only</div>')
+    col_btn1, col_btn2, col_btn3, col_info = st.columns([1, 1, 1, 2])
     with col_btn1:
-        run_scan   = st.button("🚀 Run Full Scan", type="primary", use_container_width=True)
+        if is_admin:
+            run_scan = st.button("🚀 Full S&P Scan", type="primary", use_container_width=True)
+        else:
+            run_scan = False
+            st.markdown(_RO, unsafe_allow_html=True)
     with col_btn2:
-        clear_hist = st.button("🗑️ Clear History", use_container_width=True)
+        if is_admin:
+            run_fast_scan = st.button("⚡ Fast Watchlist", use_container_width=True, help="Scans your watchlist (≤25 tickers) in under 8 seconds using batch snapshots + parallel FTFC")
+        else:
+            run_fast_scan = False
+    with col_btn3:
+        if is_admin:
+            clear_hist = st.button("🗑️ Clear History", use_container_width=True)
+        else:
+            clear_hist = False
     with col_info:
         next_scan = get_next_scan_time()
         if next_scan.get('minutes_until'):
@@ -1340,6 +1948,496 @@ elif page == "scanner":
     if st.session_state.get('play_sound', False):
         st.markdown(get_alert_sound_html("success"), unsafe_allow_html=True)
         st.session_state.play_sound = False
+
+    # ── Fast Watchlist Scan ───────────────────────────────────────────────────
+    if run_fast_scan:
+        from config import ALL_TICKERS
+        _fp = st.progress(0); _fs = st.empty()
+
+        def _fast_progress(stage, current, total, message):
+            pct = int((current / max(1, total)) * 20) if stage == "snapshot" else (20 + int((current / max(1, total)) * 80))
+            _fp.progress(min(pct, 100))
+            _fs.markdown(f"<div style='color:#94a3b8;font-family:JetBrains Mono,monospace;font-size:13px;'>{message}</div>", unsafe_allow_html=True)
+
+        _fr = run_watchlist_scan(tickers=ALL_TICKERS, timeout_secs=7.5, progress_callback=_fast_progress)
+        st.session_state.fast_scan_results = _fr
+        _fp.progress(100)
+        _warn = f" ⚠️ {_fr['warning']}" if _fr.get('truncated') else ""
+        _fs.markdown(
+            f"<div style='color:#22c55e;font-family:JetBrains Mono,monospace;font-size:13px;'>"
+            f"⚡ Done in {_fr['elapsed_secs']}s — {_fr['completed']}/{_fr['total_scanned']} tickers, "
+            f"ranked by FTFC alignment{_warn}</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Fast Scan Results Display ─────────────────────────────────────────────
+    _fsr = st.session_state.get('fast_scan_results')
+    if _fsr and _fsr.get('results'):
+        _tf_names = ['Monthly', 'Weekly', 'Daily', '4H', '60min', '15min', '5min']
+        _tf_short  = ['M', 'W', 'D', '4H', '60', '15', '5']
+
+        st.markdown(
+            f"<div class='section-header' style='margin-top:24px;'>⚡ Fast Watchlist — "
+            f"{_fsr['completed']}/{_fsr['total_scanned']} tickers · {_fsr['elapsed_secs']}s · "
+            f"ranked by FTFC alignment</div>",
+            unsafe_allow_html=True,
+        )
+        if _fsr.get('truncated'):
+            st.warning(_fsr['warning'])
+
+        # ── Regime context (fetched once for the whole results block) ─────────
+        _scan_regime_data: dict = {}
+        if REGIME_ENGINE_AVAILABLE:
+            try:
+                _scan_regime_data = _hmm_get_regime()
+            except Exception:
+                pass
+        _scan_regime    = _scan_regime_data.get('regime', '')
+        _scan_regime_meta = _scan_regime_data.get('meta') or _REGIME_META.get(_scan_regime, {})
+        # Risk multiplier: Volatile → 50%, everything else → 100%
+        _regime_risk_mult = 0.5 if 'Volatile' in _scan_regime else 1.0
+
+        # ── Pokémon-style trade card builder (Pass 1 skeleton → Pass 2 chart) ──
+        def _make_card_html(cv, art_html=''):
+            d         = cv['dir']
+            ptr       = cv['ptr']
+            hp_color  = '#22c55e' if ptr >= 70 else ('#f59e0b' if ptr >= 40 else '#ef4444')
+            hp_w      = str(max(0, min(100, ptr))) + '%'
+            dir_color = '#4ade80' if d == 'LONG' else ('#f87171' if d == 'SHORT' else '#6b7280')
+            dir_arrow = '▲' if d == 'LONG' else ('▼' if d == 'SHORT' else '—')
+            ps        = ('$' + str(cv['price'])) if cv['price'] else '—'
+            card_cls  = 'trade-card alpha-glow' if cv.get('alpha_setup') else 'trade-card'
+
+            # Compact sector badge
+            sec_etf = cv.get('sector_etf', '')
+            sec_dir = cv.get('sector_dir', 'neutral')
+            if sec_etf:
+                sec_c = '#4ade80' if sec_dir == 'up' else ('#f87171' if sec_dir == 'down' else '#6b7280')
+                sec_a = '▲' if sec_dir == 'up' else ('▼' if sec_dir == 'down' else '—')
+                sec_badge = (
+                    '<span style="background:#111827;color:' + sec_c + ';border-radius:4px;'
+                    'padding:1px 6px;font-size:9px;font-family:\'DM Mono\',monospace;font-weight:600;">'
+                    + sec_etf + ' ' + sec_a + '</span>'
+                )
+            else:
+                sec_badge = ''
+
+            div_tag = (
+                '<span style="color:#f59e0b;font-size:9px;font-family:\'DM Mono\',monospace;">'
+                '⚠ Div</span>'
+            ) if cv.get('sector_div') else ''
+
+            # FTFC energy dots
+            tf_names = ['Monthly', 'Weekly', 'Daily', '4H', '60min', '15min', '5min']
+            tf_short = ['M', 'W', 'D', '4H', '60', '15', '5']
+            stack    = cv.get('ftfc_stack', [])
+            tf_map   = {t.get('tf'): t for t in stack}
+            e_html   = '<div class="tc-energy-row"><span class="tc-energy-label">FTFC</span>'
+            for tfn, tfs in zip(tf_names, tf_short):
+                tfd   = tf_map.get(tfn, {}).get('direction', 'neutral')
+                dot_c = '#22c55e' if tfd == 'up' else ('#ef4444' if tfd == 'down' else '#1e2433')
+                bdr_c = '#166534' if tfd == 'up' else ('#7f1d1d' if tfd == 'down' else '#374151')
+                e_html += (
+                    '<div class="tc-energy-dot">'
+                    '<div style="width:12px;height:12px;border-radius:50%;background:' + dot_c + ';'
+                    'border:1.5px solid ' + bdr_c + ';"></div>'
+                    '<span style="font-size:7px;color:#374151;font-family:\'DM Mono\',monospace;">'
+                    + tfs + '</span></div>'
+                )
+            e_html += '</div>'
+
+            # Moves section
+            gap_type    = cv.get('gap_type', 'No Gap')
+            gap_pct     = cv.get('gap_pct', 0.0)
+            gap_c       = '#4ade80' if 'Up' in gap_type else ('#f87171' if 'Down' in gap_type else '#6b7280')
+            gap_icon    = '⚡' if 'Up' in gap_type else ('⬇' if 'Down' in gap_type else '◦')
+            gap_pct_str = (('+' if gap_pct > 0 else '') + str(round(gap_pct, 1)) + '%') if abs(gap_pct) > 0.01 else ''
+            exec_str    = 'BUY CALL' if d == 'LONG' else ('BUY PUT' if d == 'SHORT' else '—')
+            ss          = (' +' + str(cv['sentinel_bonus']) + ' Sentinel') if cv.get('sentinel_bonus') else ''
+
+            alpha_badge = (
+                '<div style="text-align:center;font-size:11px;color:#fb923c;'
+                'font-family:\'DM Mono\',monospace;font-weight:700;letter-spacing:1px;'
+                'padding:5px 0 1px 0;">\U0001f525 ALPHA SETUP</div>'
+            ) if cv.get('alpha_setup') else ''
+
+            return (
+                '<div class="' + card_cls + '">'
+                '<div class="tc-glare"></div>'
+                '<div class="tc-foil"></div>'
+                '<div class="tc-inner">'
+                '<div class="tc-header">'
+                '<div>'
+                '<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;">'
+                '<span style="font-size:18px;color:' + dir_color + ';">' + dir_arrow + '</span>'
+                '<span class="tc-name">' + cv['sym'] + '</span>'
+                '</div>'
+                '<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;">'
+                + sec_badge + cv.get('gap_badge_html', '') + div_tag +
+                '<span style="color:#6b7280;font-family:\'DM Mono\',monospace;font-size:11px;">'
+                + ps + ' ' + cv['chg_str'] + '</span>'
+                '</div></div>'
+                '<div class="tc-hp-col">'
+                '<div style="font-size:9px;color:#4b5563;font-family:\'DM Mono\',monospace;'
+                'letter-spacing:1px;text-align:right;margin-bottom:2px;">HP</div>'
+                '<div class="tc-hp-num" style="color:' + hp_color + ';">' + str(ptr) + '</div>'
+                '<div style="background:#0d1117;border-radius:3px;width:56px;height:4px;'
+                'overflow:hidden;margin:3px 0 0 auto;">'
+                '<div style="width:' + hp_w + ';height:100%;background:' + hp_color + ';border-radius:3px;"></div>'
+                '</div>'
+                '<div style="font-size:8px;color:#374151;font-family:\'DM Mono\',monospace;'
+                'text-align:right;margin-top:3px;">' + cv.get('scan_time', '') + '</div>'
+                '</div></div>'
+                '<div class="tc-art-box">' + art_html + '</div>'
+                + e_html +
+                '<div class="tc-moves">'
+                '<div class="tc-move-line">'
+                '<span style="color:' + gap_c + ';">' + gap_icon + '</span>'
+                '<span style="color:' + gap_c + ';font-weight:700;">' + gap_type + '</span>'
+                + ('<span style="color:#6b7280;"> ' + gap_pct_str + '</span>' if gap_pct_str else '') +
+                '</div>'
+                '<div class="tc-move-line">'
+                '<span style="color:#818cf8;">⚔</span>'
+                '<span style="color:#c4b5fd;font-weight:700;">' + exec_str + '</span>'
+                + ('<span style="color:#fb923c;font-size:9px;"> ' + ss + '</span>' if ss else '') +
+                '</div></div>'
+                '<div class="tc-footer">'
+                '<span class="tc-footer-tag">Paper Trade</span>'
+                '<span class="tc-footer-tag" style="color:#6366f1;">33% Guard ☑</span>'
+                '</div>'
+                + alpha_badge +
+                '</div></div>'
+            )
+
+        _SKELETON_ART = (
+            '<div style="width:100%;height:72px;position:relative;'
+            'background:linear-gradient(90deg,#0d1117 25%,#1a2332 50%,#0d1117 75%);'
+            'background-size:200% 100%;animation:tr-shimmer 1.5s ease-in-out infinite;">'
+            '<div style="position:absolute;inset:0;display:flex;align-items:center;'
+            'justify-content:center;">'
+            '<span style="font-family:\'DM Mono\',monospace;font-size:9px;color:#374151;'
+            'letter-spacing:2px;">LOADING CHART...</span>'
+            '</div></div>'
+        )
+
+        _card_slots = []  # [(placeholder, cv_dict)] — filled by Pass 1, updated by Pass 2
+        _cols = st.columns(5)
+
+        for _ci, _r in enumerate(_fsr['results']):
+            _sym     = _r['ticker']
+            _price   = _r.get('price')
+            _chg     = _r.get('change_pct')
+            _dir     = _r.get('direction', 'FLAT')
+            _ptr     = _r.get('ptr_score', 0)
+            _comp    = _r.get('composite', 0)
+            _stack   = _r.get('ftfc_stack', [])
+            _au       = _r.get('aligned_up', 0)
+            _ad       = _r.get('aligned_down', 0)
+            _tot      = _r.get('total_tfs', 0)
+            _gap_type         = _r.get('gap_type', 'No Gap')
+            _gap_pct          = _r.get('gap_pct', 0.0)
+            _sector_etf       = _r.get('sector_etf', '')
+            _sector_dir       = _r.get('sector_dir', 'neutral')
+            _sentinel_bonus   = _r.get('sentinel_bonus', 0)
+            _sector_div       = _r.get('sector_divergence', False)
+            _alpha_setup      = _r.get('alpha_setup', False)
+
+            _arrow_color = '#4ade80' if _dir == 'LONG' else ('#f87171' if _dir == 'SHORT' else '#6b7280')
+            _arrow       = '▲' if _dir == 'LONG' else ('▼' if _dir == 'SHORT' else '—')
+            _chg_str     = f"{'+' if _chg and _chg > 0 else ''}{_chg:.2f}%" if _chg is not None else '—'
+            _chg_color   = '#4ade80' if _chg and _chg > 0 else ('#f87171' if _chg and _chg < 0 else '#6b7280')
+
+            # Gap badge
+            _gap_badge_map = {
+                'Full Up':    ('FG-UP', '#4ade80', '#14532d'),
+                'Partial Up': ('PG-UP', '#86efac', '#1a2e1a'),
+                'Full Down':  ('FG-DN', '#f87171', '#7f1d1d'),
+                'Partial Down': ('PG-DN', '#fca5a5', '#3a1212'),
+            }
+            if _gap_type in _gap_badge_map:
+                _gl, _gc, _gbg = _gap_badge_map[_gap_type]
+                _gap_sign = '+' if _gap_pct > 0 else ''
+                _gap_badge_html = (
+                    f'<span style="background:{_gbg};color:{_gc};border-radius:6px;'
+                    f'padding:2px 8px;font-size:10px;font-family:\'DM Mono\',monospace;'
+                    f'font-weight:700;">{_gl} {_gap_sign}{_gap_pct:.1f}%</span>'
+                )
+            else:
+                _gap_badge_html = ''
+
+            # Sector badge
+            if _sector_etf and _sector_dir != 'neutral':
+                _sec_arrow = '▲' if _sector_dir == 'up' else '▼'
+                _sec_color = '#4ade80' if _sector_dir == 'up' else '#f87171'
+                _sec_bg    = '#14532d' if _sector_dir == 'up' else '#7f1d1d'
+                _sector_badge_html = (
+                    f'<span style="background:{_sec_bg};color:{_sec_color};border-radius:6px;'
+                    f'padding:2px 8px;font-size:10px;font-family:\'DM Mono\',monospace;'
+                    f'font-weight:700;">{_sector_etf} {_sec_arrow}</span>'
+                )
+            elif _sector_etf:
+                _sector_badge_html = (
+                    f'<span style="background:#1f2937;color:#6b7280;border-radius:6px;'
+                    f'padding:2px 8px;font-size:10px;font-family:\'DM Mono\',monospace;">'
+                    f'{_sector_etf} —</span>'
+                )
+            else:
+                _sector_badge_html = ''
+
+            # Divergence / Alpha overlays
+            _divergence_html = (
+                '<div style="color:#f59e0b;font-size:11px;font-family:\'DM Mono\',monospace;'
+                'margin-top:6px;">⚠️ Sector Divergence — trade with caution</div>'
+                if _sector_div else ''
+            )
+            _alpha_html = (
+                '<div style="color:#fb923c;font-size:12px;font-family:\'DM Mono\',monospace;'
+                'font-weight:700;letter-spacing:1px;margin-top:6px;">🔥 ALPHA SETUP</div>'
+                if _alpha_setup else ''
+            )
+            _card_border = 'rgba(251,146,60,0.6)' if _alpha_setup else 'rgba(99,102,241,0.15)'
+            _card_bg     = ('linear-gradient(135deg,#1a0f00,#0f0a00)'
+                            if _alpha_setup else
+                            'linear-gradient(135deg,#111827,#0f172a)')
+
+            # Build FTFC heat strip
+            _strip_html = ''
+            _tf_map = {tf.get('tf'): tf for tf in _stack}
+            for _tname, _tshort in zip(_tf_names, _tf_short):
+                _tf_data  = _tf_map.get(_tname, {})
+                _tf_dir   = _tf_data.get('direction', 'neutral')
+                _bg = '#166534' if _tf_dir == 'up' else ('#7f1d1d' if _tf_dir == 'down' else '#1f2937')
+                _fc = '#4ade80' if _tf_dir == 'up' else ('#f87171' if _tf_dir == 'down' else '#374151')
+                _strip_html += (
+                    f'<div style="display:inline-flex;flex-direction:column;align-items:center;'
+                    f'background:{_bg};border-radius:5px;padding:3px 6px;min-width:28px;">'
+                    f'<span style="font-size:9px;color:#6b7280;">{_tshort}</span>'
+                    f'<span style="font-size:10px;font-weight:700;color:{_fc};">'
+                    f'{"▲" if _tf_dir=="up" else ("▼" if _tf_dir=="down" else "—")}</span>'
+                    f'</div>'
+                )
+
+            # PTR bar fill
+            _ptr_bar_w  = max(0, min(100, _ptr))
+            _ptr_color  = '#22c55e' if _ptr >= 70 else ('#f59e0b' if _ptr >= 40 else '#ef4444')
+
+            # Capture card vars for Pass 2 chart update
+            _cv = {
+                'sym': _sym, 'price': _price, 'dir': _dir, 'ptr': _ptr,
+                'au': _au, 'ad': _ad, 'tot': _tot,
+                'arrow': _arrow, 'arrow_color': _arrow_color,
+                'chg_str': _chg_str, 'chg_color': _chg_color,
+                'gap_badge_html': _gap_badge_html,
+                'sector_badge_html': _sector_badge_html,
+                'alpha_html': _alpha_html,
+                'divergence_html': _divergence_html,
+                'card_border': _card_border, 'card_bg': _card_bg,
+                'strip_html': _strip_html,
+                'ptr_bar_w': _ptr_bar_w, 'ptr_color': _ptr_color,
+                'sentinel_bonus': _sentinel_bonus,
+                'scan_time': _r.get('scan_time', ''),
+                # Pokémon card fields
+                'alpha_setup': _alpha_setup,
+                'sector_etf':  _sector_etf,
+                'sector_dir':  _sector_dir,
+                'sector_div':  _sector_div,
+                'gap_type':    _gap_type,
+                'gap_pct':     _gap_pct,
+                'ftfc_stack':  _stack,
+            }
+            _col = _cols[_ci % 5]
+            with _col:
+                # Pass 1 — instant render with shimmer skeleton where chart will go
+                _ph = st.empty()
+                _ph.markdown(_make_card_html(_cv, _SKELETON_ART), unsafe_allow_html=True)
+                _card_slots.append((_ph, _cv))
+
+                # ── Trade Setup expander ──────────────────────────────────────────
+                # Alpha Kill Switch: full gap + sector confirmed BUT regime is Chop
+                # → downgrade to information-only, no execution button
+                _alpha_chop_killed = _alpha_setup and _scan_regime == 'Chop'
+
+                if TRADE_SETUP_AVAILABLE and _price and _dir != 'FLAT':
+                    if _alpha_chop_killed:
+                        # Show information-only card instead of expander
+                        st.markdown(f"""
+<div style="background:#1c1508;border:1px solid rgba(251,191,36,0.35);border-radius:12px;
+    padding:10px 14px;margin:4px 0 8px 0;">
+  <div style="font-size:11px;color:#f59e0b;font-family:'DM Mono',monospace;font-weight:700;
+      letter-spacing:1px;">ALPHA SETUP — INFORMATION ONLY</div>
+  <div style="font-size:10px;color:#6b7280;margin-top:4px;font-family:'DM Sans',sans-serif;">
+    Full gap + sector alignment detected, but HMM regime is <b style="color:#f59e0b;">Chop</b>.
+    Monitor this setup — execution disabled until regime clears.
+  </div>
+</div>""", unsafe_allow_html=True)
+                    else:
+                        # Build regime sizing badge for the card header
+                        if _scan_regime:
+                            _rsz_label = _scan_regime_meta.get('sizing', '')
+                            _rsz_color = _scan_regime_meta.get('color', '#6b7280')
+                            _rsz_pct   = '50%' if _regime_risk_mult < 1.0 else '100%'
+                            _regime_sizing_badge = (
+                                f'<span style="background:{_scan_regime_meta.get("bg","#1f2937")};'
+                                f'color:{_rsz_color};border-radius:4px;padding:1px 7px;'
+                                f'font-size:9px;font-family:\'DM Mono\',monospace;">'
+                                f'HMM {_scan_regime} · {_rsz_pct} size</span>'
+                            )
+                        else:
+                            _regime_sizing_badge = ''
+
+                        _expander_label = (
+                            f"Suggested Execution — {_sym}"
+                            + (" [RUNNER]" if any(
+                                (lambda ts: ts.get('runner_active', False))(
+                                    build_trade_setup(_sym, _dir, tt, float(_price), _gap_type,
+                                                      risk_multiplier=_regime_risk_mult)
+                                )
+                                for tt in ('intraday',)
+                            ) else "")
+                        )
+                        with st.expander(_expander_label, expanded=False):
+                            if _regime_sizing_badge:
+                                st.markdown(_regime_sizing_badge, unsafe_allow_html=True)
+                            _ts_cols = st.columns(2)
+                            for _ts_col, _ts_type in zip(_ts_cols, ('intraday', 'swing')):
+                                try:
+                                    _ts = build_trade_setup(
+                                        ticker=_sym, direction=_dir,
+                                        trade_type=_ts_type, spot_price=float(_price),
+                                        gap_type=_gap_type,
+                                        risk_multiplier=_regime_risk_mult,
+                                    )
+                                    with _ts_col:
+                                        # Error: budget too small
+                                        if _ts.get('error'):
+                                            st.markdown(f"""
+<div style="background:#0f0a0a;border:1px solid #7f1d1d;border-radius:12px;padding:14px 16px;">
+  <div style="font-size:10px;color:#6b7280;text-transform:uppercase;margin-bottom:8px;">
+    {'⚡ Intraday' if _ts_type=='intraday' else '📈 Swing'}
+  </div>
+  <div style="color:#f87171;font-size:12px;font-family:'DM Mono',monospace;">⚠️ {_ts['error']}</div>
+  <div style="font-size:11px;color:#4b5563;margin-top:6px;">
+    Min cost: ${_ts['cost_per_contract']:.0f} · Budget: ${_ts['risk_amount']}
+  </div>
+</div>""", unsafe_allow_html=True)
+                                            continue
+
+                                        _ts_clr   = '#4ade80' if _dir == 'LONG' else '#f87171'
+                                        _cost_clr = '#22c55e' if _ts['total_cost'] <= _ts['risk_amount'] else '#f59e0b'
+                                        _src_badge = (
+                                            '<span style="background:#1e3a5f;color:#60a5fa;border-radius:4px;padding:1px 6px;font-size:9px;">LIVE</span>'
+                                            if _ts['source'] == 'live' else
+                                            '<span style="background:#1f2937;color:#6b7280;border-radius:4px;padding:1px 6px;font-size:9px;">EST.</span>'
+                                        )
+                                        _runner_badge = (
+                                            '<span style="background:#1e1b4b;color:#a5b4fc;border-radius:4px;padding:1px 7px;font-size:9px;">RUNNER</span>'
+                                            if _ts['runner_active'] else ''
+                                        )
+                                        _warn_html = (
+                                            f'<div style="color:#f59e0b;font-size:10px;margin-top:6px;">⚠️ {_ts["budget_warning"]}</div>'
+                                            if _ts.get('budget_warning') else ''
+                                        )
+
+                                        st.markdown(f"""
+<div style="background:#07080d;border:1px solid rgba(99,102,241,0.2);border-radius:12px;padding:14px 16px;">
+  <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+    <span style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;">
+      {'⚡ Intraday (0DTE)' if _ts_type=='intraday' else '📈 Swing (7-14d)'}
+    </span>
+    {_src_badge} {_runner_badge}
+  </div>
+  <div style="font-size:11px;color:#94a3b8;margin-bottom:4px;">
+    Strategy: <span style="color:#e2e8f0;font-weight:600;">{_ts['strategy']}</span>
+  </div>
+  <div style="font-family:'DM Mono',monospace;font-size:15px;font-weight:700;color:{_ts_clr};margin-bottom:10px;">
+    Action: {_ts['action_str']}
+  </div>
+  <div style="display:flex;flex-direction:column;gap:5px;font-family:'DM Mono',monospace;font-size:11px;">
+    <div style="display:flex;justify-content:space-between;">
+      <span style="color:#4b5563;">Strike (ITM ~.70d)</span>
+      <span style="color:#e2e8f0;">${_ts['strike']:.2f}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;">
+      <span style="color:#4b5563;">Expiry</span>
+      <span style="color:#e2e8f0;">{_ts['exp_display']} ({_ts['dte']}d)</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;">
+      <span style="color:#4b5563;">Ask / Mid</span>
+      <span style="color:#e2e8f0;">${_ts['premium_ask']:.2f} / ${_ts['premium_mid']:.2f}</span>
+    </div>
+    <div style="border-top:1px solid #1f2937;margin:4px 0;"></div>
+    <div style="display:flex;justify-content:space-between;">
+      <span style="color:#4b5563;">Size</span>
+      <span style="color:{_ts_clr};font-weight:700;">{_ts['size_str']} contract{'s' if _ts['contracts']!=1 else ''}</span>
+    </div>
+    {'<div style="display:flex;justify-content:space-between;"><span style="color:#4b5563;">Scale-Out (T1)</span><span style="color:#fbbf24;">' + str(_ts['scale_qty']) + ' @ Prior Day High</span></div>' if _ts['runner_active'] else ''}
+    {'<div style="display:flex;justify-content:space-between;"><span style="color:#4b5563;">Runner (33% Guard)</span><span style="color:#a5b4fc;">' + str(_ts['runner_qty']) + ' — trail from HOD</span></div>' if _ts['runner_active'] else ''}
+    <div style="display:flex;justify-content:space-between;">
+      <span style="color:#4b5563;">Est. Cost</span>
+      <span style="color:{_cost_clr};font-weight:700;">${_ts['total_cost']:.2f}</span>
+    </div>
+  </div>
+  {_warn_html}
+  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #111827;font-size:10px;color:#374151;font-family:'DM Mono',monospace;">
+    OCC: {_ts['occ_symbol']}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+                                        # Register runner in session state
+                                        if _ts['runner_active']:
+                                            if 'pending_runners' not in st.session_state:
+                                                st.session_state.pending_runners = []
+                                            _runner_key = _ts['occ_symbol']
+                                            if is_admin:
+                                                if st.button(
+                                                    f"Activate Runner — {_sym}",
+                                                    key=f"runner_{_runner_key}_{_ts_type}",
+                                                    use_container_width=True,
+                                                ):
+                                                    if 'runner_manager' not in st.session_state:
+                                                        from lib.runner_manager import RunnerManager
+                                                        st.session_state.runner_manager = RunnerManager()
+                                                    st.session_state.runner_manager.add_runner(
+                                                        occ_symbol    = _runner_key,
+                                                        ticker        = _sym,
+                                                        direction     = _ts['contract_type'],
+                                                        entry_premium = _ts['premium_ask'],
+                                                        qty           = _ts['runner_qty'],
+                                                    )
+                                                    # Log to Supabase
+                                                    if TRADE_LOG_AVAILABLE:
+                                                        _entry_ctx = {
+                                                            'regime':             _scan_regime,
+                                                            'regime_confidence':  _scan_regime_data.get('confidence'),
+                                                            'ftfc_aligned':       _r.get('aligned_up') if _r.get('direction') == 'LONG' else _r.get('aligned_down'),
+                                                            'ftfc_total':         _r.get('total_tfs'),
+                                                            'gap_type':           _gap_type,
+                                                            'alpha_setup':        _alpha_setup,
+                                                            'sector_etf':         _sector_etf,
+                                                            'sentinel_bonus':     _sentinel_bonus,
+                                                        }
+                                                        log_trade_to_supabase(_ts, _entry_ctx)
+                                                    st.success(f"Runner registered: {_runner_key} ({_ts['runner_qty']} contracts)")
+                                            else:
+                                                st.markdown(
+                                                    '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
+                                                    'border-radius:8px;padding:7px 10px;font-family:DM Mono,monospace;'
+                                                    'font-size:10px;color:#374151;text-align:center;">'
+                                                    '🔒 Execution Disabled — Read-Only Mode</div>',
+                                                    unsafe_allow_html=True,
+                                                )
+                                except Exception as _ts_err:
+                                    _ts_col.caption(f"{_ts_type} unavailable: {_ts_err}")
+
+        # ── Pass 2: generate sparklines and update each placeholder ──────────
+        for _ph, _cv in _card_slots:
+            _b64 = generate_sparkline_base64(_cv['sym'])
+            if _b64:
+                _chart_art = (
+                    '<img src="data:image/png;base64,' + _b64 + '" '
+                    'style="width:100%;height:80px;object-fit:fill;display:block;" />'
+                )
+                _ph.markdown(_make_card_html(_cv, _chart_art), unsafe_allow_html=True)
 
     history = st.session_state.scan_history
 
@@ -1551,61 +2649,70 @@ elif page == "scanner":
 
                 # ── Execute buttons for A+/A grades ──────────────────────────
                 if EXECUTOR_AVAILABLE:
-                    ecols = st.columns([1, 1, 2])
-                    with ecols[0]:
-                        if is_executable_grade(gi):
-                            btn_label = f"⚡ 0DTE {direction_r} {sym}"
-                            if st.button(btn_label, key=f"exec_0dte_{sym}", type="primary", use_container_width=True):
-                                st.session_state[f"confirm_0dte_{sym}"] = True
-                    with ecols[1]:
-                        if is_executable_grade(gs):
-                            btn_label = f"📊 SWING {direction_r} {sym}"
-                            if st.button(btn_label, key=f"exec_swing_{sym}", use_container_width=True):
-                                st.session_state[f"confirm_swing_{sym}"] = True
+                    if is_admin:
+                        ecols = st.columns([1, 1, 2])
+                        with ecols[0]:
+                            if is_executable_grade(gi):
+                                btn_label = f"⚡ 0DTE {direction_r} {sym}"
+                                if st.button(btn_label, key=f"exec_0dte_{sym}", type="primary", use_container_width=True):
+                                    st.session_state[f"confirm_0dte_{sym}"] = True
+                        with ecols[1]:
+                            if is_executable_grade(gs):
+                                btn_label = f"📊 SWING {direction_r} {sym}"
+                                if st.button(btn_label, key=f"exec_swing_{sym}", use_container_width=True):
+                                    st.session_state[f"confirm_swing_{sym}"] = True
 
-                    # 0DTE confirm
-                    if st.session_state.get(f"confirm_0dte_{sym}"):
-                        st.warning(f"⚠️ Confirm 0DTE paper trade: {direction_r} {sym} @ ~${price} | Grade: {gi}")
-                        cy, cn = st.columns(2)
-                        with cy:
-                            if st.button(f"✅ CONFIRM 0DTE {sym}", key=f"yes_0dte_{sym}", type="primary"):
-                                exe = get_executor()
-                                result = exe.submit_equity_order(
-                                    symbol=sym, side='buy' if direction_r=='LONG' else 'sell',
-                                    price=float(price), regime=regime_r,
-                                    trade_type='0DTE', grade=gi,
-                                )
-                                if result:
-                                    log_order(result)
-                                    st.success(f"✅ 0DTE order fired! ID: {result['order_id'][:8]}...")
-                                else:
-                                    st.error("❌ Order blocked by session/regime rules.")
-                                st.session_state[f"confirm_0dte_{sym}"] = False
-                        with cn:
-                            if st.button(f"❌ Cancel", key=f"cancel_0dte_{sym}"):
-                                st.session_state[f"confirm_0dte_{sym}"] = False
+                        # 0DTE confirm
+                        if st.session_state.get(f"confirm_0dte_{sym}"):
+                            st.warning(f"⚠️ Confirm 0DTE paper trade: {direction_r} {sym} @ ~${price} | Grade: {gi}")
+                            cy, cn = st.columns(2)
+                            with cy:
+                                if st.button(f"✅ CONFIRM 0DTE {sym}", key=f"yes_0dte_{sym}", type="primary"):
+                                    exe = get_executor()
+                                    result = exe.submit_equity_order(
+                                        symbol=sym, side='buy' if direction_r=='LONG' else 'sell',
+                                        price=float(price), regime=regime_r,
+                                        trade_type='0DTE', grade=gi,
+                                    )
+                                    if result:
+                                        log_order(result)
+                                        st.success(f"✅ 0DTE order fired! ID: {result['order_id'][:8]}...")
+                                    else:
+                                        st.error("❌ Order blocked by session/regime rules.")
+                                    st.session_state[f"confirm_0dte_{sym}"] = False
+                            with cn:
+                                if st.button(f"❌ Cancel", key=f"cancel_0dte_{sym}"):
+                                    st.session_state[f"confirm_0dte_{sym}"] = False
 
-                    # Swing confirm
-                    if st.session_state.get(f"confirm_swing_{sym}"):
-                        st.warning(f"⚠️ Confirm SWING paper trade: {direction_r} {sym} @ ~${price} | Grade: {gs}")
-                        cy2, cn2 = st.columns(2)
-                        with cy2:
-                            if st.button(f"✅ CONFIRM SWING {sym}", key=f"yes_swing_{sym}", type="primary"):
-                                exe = get_executor()
-                                result = exe.submit_equity_order(
-                                    symbol=sym, side='buy' if direction_r=='LONG' else 'sell',
-                                    price=float(price), regime=regime_r,
-                                    trade_type='swing', grade=gs,
-                                )
-                                if result:
-                                    log_order(result)
-                                    st.success(f"✅ Swing order fired! ID: {result['order_id'][:8]}...")
-                                else:
-                                    st.error("❌ Order blocked by session/regime rules.")
-                                st.session_state[f"confirm_swing_{sym}"] = False
-                        with cn2:
-                            if st.button(f"❌ Cancel", key=f"cancel_swing_{sym}"):
-                                st.session_state[f"confirm_swing_{sym}"] = False
+                        # Swing confirm
+                        if st.session_state.get(f"confirm_swing_{sym}"):
+                            st.warning(f"⚠️ Confirm SWING paper trade: {direction_r} {sym} @ ~${price} | Grade: {gs}")
+                            cy2, cn2 = st.columns(2)
+                            with cy2:
+                                if st.button(f"✅ CONFIRM SWING {sym}", key=f"yes_swing_{sym}", type="primary"):
+                                    exe = get_executor()
+                                    result = exe.submit_equity_order(
+                                        symbol=sym, side='buy' if direction_r=='LONG' else 'sell',
+                                        price=float(price), regime=regime_r,
+                                        trade_type='swing', grade=gs,
+                                    )
+                                    if result:
+                                        log_order(result)
+                                        st.success(f"✅ Swing order fired! ID: {result['order_id'][:8]}...")
+                                    else:
+                                        st.error("❌ Order blocked by session/regime rules.")
+                                    st.session_state[f"confirm_swing_{sym}"] = False
+                            with cn2:
+                                if st.button(f"❌ Cancel", key=f"cancel_swing_{sym}"):
+                                    st.session_state[f"confirm_swing_{sym}"] = False
+                    else:
+                        st.markdown(
+                            '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
+                            'border-radius:8px;padding:8px 14px;font-family:DM Mono,monospace;'
+                            'font-size:11px;color:#374151;text-align:center;margin:4px 0;">'
+                            '🔒 Execution Disabled — Read-Only Mode</div>',
+                            unsafe_allow_html=True,
+                        )
 
                 with st.expander(f"📋 {sym} — Signal Reasoning", expanded=False):
                     col_r1, col_r2 = st.columns(2)
@@ -1695,9 +2802,18 @@ elif page == "live":
 
     ks_col1, ks_col2 = st.columns([1, 3])
     with ks_col1:
-        if st.button("🚨 KILL SWITCH — CLOSE ALL", type="primary", use_container_width=True):
-            st.session_state['confirm_kill'] = True
-    if st.session_state.get('confirm_kill'):
+        if is_admin:
+            if st.button("🚨 KILL SWITCH — CLOSE ALL", type="primary", use_container_width=True):
+                st.session_state['confirm_kill'] = True
+        else:
+            st.markdown(
+                '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
+                'border-radius:8px;padding:8px 10px;font-family:DM Mono,monospace;'
+                'font-size:10px;color:#374151;text-align:center;">'
+                '🔒 Execution Disabled — Read-Only Mode</div>',
+                unsafe_allow_html=True,
+            )
+    if is_admin and st.session_state.get('confirm_kill'):
         st.error("**ARE YOU SURE?** This will close ALL open positions immediately.")
         kc1, kc2 = st.columns(2)
         with kc1:
@@ -1709,6 +2825,137 @@ elif page == "live":
         with kc2:
             if st.button("❌ Cancel"):
                 st.session_state['confirm_kill'] = False
+
+    # ── Runner Monitor ────────────────────────────────────────────────────────
+    if 'runner_manager' not in st.session_state:
+        from lib.runner_manager import RunnerManager
+        st.session_state.runner_manager = RunnerManager()
+
+    _rm = st.session_state.runner_manager
+    _active_runners = _rm.active_runners()
+    _closed_runners = _rm.closed_runners()
+
+    if _active_runners or _closed_runners:
+        st.markdown("<div class='section-header' style='margin-top:24px;'>🏃 Runner Monitor — 33% Profit Guard</div>", unsafe_allow_html=True)
+
+        if _active_runners:
+            _rm_refresh = st.button("🔄 Refresh Runner Prices", use_container_width=False)
+
+            for _run in _active_runners:
+                _run_sym   = _run['symbol']
+                _run_entry = _run['entry']
+                _run_hod   = _run['hod']
+                _run_trig  = _run['trigger']
+                _run_dir   = _run['direction']
+
+                # Try to get current premium from Alpaca if refresh clicked
+                _run_current = _run_hod   # default to HOD if no live price
+                _run_action  = None
+                if _rm_refresh:
+                    try:
+                        from alpaca.data.historical.option import OptionHistoricalDataClient
+                        from alpaca.data.requests import OptionSnapshotRequest
+                        from config import get_alpaca_keys
+                        _rk, _rs = get_alpaca_keys()
+                        _oc = OptionHistoricalDataClient(api_key=_rk, secret_key=_rs)
+                        _snaps = _oc.get_option_snapshot(OptionSnapshotRequest(symbol_or_symbols=_run_sym))
+                        _snap  = (_snaps or {}).get(_run_sym)
+                        if _snap and _snap.latest_trade:
+                            _run_current = float(_snap.latest_trade.price)
+                        _run_action = _rm.update(_run_sym, _run_current)
+                    except Exception:
+                        pass
+
+                _gain_pct    = round((_run_hod / _run_entry - 1) * 100, 1)
+                _cushion_pct = round((_run_current / _run_hod * 100 - 67), 1) if _run_hod else 0
+                _cushion_clr = '#22c55e' if _cushion_pct > 15 else ('#f59e0b' if _cushion_pct > 5 else '#ef4444')
+
+                if _run_action and _run_action.get('action') == 'close':
+                    st.error(f"CLOSE RUNNER NOW — {_run['ticker']} | {_run_action['reason']}")
+                    log_msg = _run_action.get('log_msg', '')
+                    if log_msg and 'order_log' in st.session_state:
+                        st.session_state.order_log.append({
+                            'timestamp': datetime.now().isoformat(),
+                            'type': 'runner_exit', 'symbol': _run_sym,
+                            'message': log_msg,
+                        })
+                    # Log exit to Supabase — include peak_premium so we can measure "meat on the bone"
+                    if TRADE_LOG_AVAILABLE:
+                        log_trade_exit(
+                            occ_symbol    = _run_sym,
+                            exit_premium  = float(_run_action.get('current', _run_entry)),
+                            exit_reason   = _run_action.get('reason', '33% Guard'),
+                            peak_premium  = float(_run_action.get('peak', _run_hod)),
+                            entry_premium = float(_run_entry),
+                        )
+
+                st.markdown(f"""
+<div style="background:linear-gradient(135deg,#0d1117,#0f172a);border:1px solid rgba(165,180,252,0.2);
+    border-radius:14px;padding:16px 20px;margin:6px 0;">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+    <span style="font-size:18px;">🏃</span>
+    <span style="font-family:'DM Mono',monospace;font-size:16px;font-weight:700;color:#e2e8f0;">
+      {_run['ticker']} {_run_dir}
+    </span>
+    <span style="font-size:11px;color:#6b7280;font-family:'DM Mono',monospace;">{_run_sym}</span>
+    <span style="background:#1e1b4b;color:#a5b4fc;border-radius:6px;padding:2px 8px;font-size:10px;margin-left:auto;">
+      {_run['qty']} contract{'s' if _run['qty']!=1 else ''} · entered {_run['entry_time']}
+    </span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
+    <div style="text-align:center;background:#07080d;border-radius:8px;padding:10px;">
+      <div style="font-size:10px;color:#4b5563;text-transform:uppercase;letter-spacing:1px;">Entry</div>
+      <div style="font-family:'DM Mono',monospace;font-size:16px;color:#94a3b8;">${_run_entry:.2f}</div>
+    </div>
+    <div style="text-align:center;background:#07080d;border-radius:8px;padding:10px;">
+      <div style="font-size:10px;color:#4b5563;text-transform:uppercase;letter-spacing:1px;">Current Peak (HOD)</div>
+      <div style="font-family:'DM Mono',monospace;font-size:16px;color:#4ade80;">${_run_hod:.2f}</div>
+      <div style="font-size:10px;color:#22c55e;">+{_gain_pct:.1f}% from entry</div>
+    </div>
+    <div style="text-align:center;background:#07080d;border-radius:8px;padding:10px;">
+      <div style="font-size:10px;color:#4b5563;text-transform:uppercase;letter-spacing:1px;">33% Trigger</div>
+      <div style="font-family:'DM Mono',monospace;font-size:16px;color:#f59e0b;">${_run_trig:.2f}</div>
+      <div style="font-size:10px;color:#6b7280;">= HOD × 0.67</div>
+    </div>
+    <div style="text-align:center;background:#07080d;border-radius:8px;padding:10px;">
+      <div style="font-size:10px;color:#4b5563;text-transform:uppercase;letter-spacing:1px;">Cushion</div>
+      <div style="font-family:'DM Mono',monospace;font-size:16px;color:{_cushion_clr};">{_cushion_pct:.1f}%</div>
+      <div style="font-size:10px;color:#6b7280;">above trigger</div>
+    </div>
+  </div>
+  {'<div style="margin-top:10px;background:#1a1505;border-radius:6px;padding:8px 12px;font-size:11px;color:#fbbf24;font-family:DM Mono,monospace;">✅ T1 Hit — Breakeven Stop Active at $' + f"{_run_entry:.2f}" + '</div>' if _run['t1_hit'] else ''}
+</div>""", unsafe_allow_html=True)
+
+                if is_admin and st.button(f"Close Runner — {_run['ticker']}", key=f"close_runner_{_run_sym}"):
+                    if exe:
+                        exe.close_position(_run_sym)
+                    _rm.runners[_run_sym].closed = True
+                    _rm.runners[_run_sym].close_reason = "Manual Close"
+                    if 'order_log' in st.session_state:
+                        st.session_state.order_log.append({
+                            'timestamp': datetime.now().isoformat(),
+                            'type': 'runner_exit', 'symbol': _run_sym,
+                            'message': f"Runner Closed: Manual (Peak ${_run_hod:.2f})",
+                        })
+                    if TRADE_LOG_AVAILABLE:
+                        log_trade_exit(
+                            occ_symbol    = _run_sym,
+                            exit_premium  = float(_run_current),
+                            exit_reason   = 'Manual Close',
+                            peak_premium  = float(_run_hod),
+                            entry_premium = float(_run_entry),
+                        )
+                    st.success("Runner closed.")
+                    st.rerun()
+
+        if _closed_runners:
+            with st.expander(f"📋 Closed Runners ({len(_closed_runners)})", expanded=False):
+                for _cr in _closed_runners:
+                    st.markdown(
+                        f"**{_cr['ticker']}** `{_cr['symbol']}` — "
+                        f"Entry: ${_cr['entry']:.2f} · HOD: ${_cr['hod']:.2f} · "
+                        f"Trigger: ${_cr['trigger']:.2f} | _{_cr['close_reason']}_"
+                    )
 
     st.markdown("<div class='section-header' style='margin-top:24px;'>Open Positions</div>", unsafe_allow_html=True)
 
@@ -1767,13 +3014,21 @@ elif page == "live":
             """, unsafe_allow_html=True)
 
             # Per-position close button
-            if st.button(f"Close {p['symbol']}", key=f"close_{p['symbol']}", use_container_width=False):
-                if exe.close_position(p['symbol']):
-                    st.success(f"✅ {p['symbol']} position closed.")
-                    st.session_state['_acct_cache_time'] = 0
-                    st.rerun()
-                else:
-                    st.error(f"❌ Failed to close {p['symbol']}")
+            if is_admin:
+                if st.button(f"Close {p['symbol']}", key=f"close_{p['symbol']}", use_container_width=False):
+                    if exe.close_position(p['symbol']):
+                        st.success(f"✅ {p['symbol']} position closed.")
+                        st.session_state['_acct_cache_time'] = 0
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Failed to close {p['symbol']}")
+            else:
+                st.markdown(
+                    '<span style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
+                    'border-radius:6px;padding:5px 10px;font-family:DM Mono,monospace;'
+                    'font-size:10px;color:#374151;">🔒 Read-Only</span>',
+                    unsafe_allow_html=True,
+                )
     else:
         st.markdown("""
         <div style='text-align:center;padding:50px 20px;'>
@@ -2394,3 +3649,476 @@ elif page == "backtest":
         progress_bar.progress(100)
         status_text.markdown("<div style='color:#22c55e;font-family:JetBrains Mono,monospace;font-size:13px;'>✅ Walk-forward complete</div>", unsafe_allow_html=True)
         display_wf_results(results, mode_label)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: PERFORMANCE — Self-Improving Loop Analytics
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "performance":
+    show_tab_header("performance", "Performance Analytics", datetime.now().strftime('%B %d, %Y'))
+
+    # ── Migration guard ───────────────────────────────────────────────────────
+    _raw_trades = []
+    _tl_error   = None
+    if not TRADE_LOG_AVAILABLE:
+        st.error("Trade log unavailable — executor import failed.")
+    else:
+        try:
+            _raw_trades = fetch_trade_log(limit=500)
+        except Exception as _e:
+            _tl_error = str(_e)
+
+    if _tl_error and 'PGRST205' in str(_tl_error):
+        st.markdown("""
+<div style="background:#1c1508;border:1px solid rgba(251,191,36,0.4);border-radius:14px;
+    padding:20px 24px;margin-bottom:16px;">
+  <div style="font-size:14px;color:#f59e0b;font-weight:700;font-family:'DM Mono',monospace;
+      margin-bottom:8px;">Database Migration Required</div>
+  <div style="font-size:13px;color:#94a3b8;font-family:'DM Sans',sans-serif;line-height:1.6;">
+    The <code>trade_log</code> table does not exist yet.<br>
+    To activate trade logging:<br>
+    1. Open your Supabase dashboard<br>
+    2. Go to <b>SQL Editor</b> → New Query<br>
+    3. Paste the contents of <code>supabase_migration.sql</code> → Run<br>
+    4. Reload this page
+  </div>
+</div>""", unsafe_allow_html=True)
+        st.code(open(
+            os.path.join(os.path.dirname(__file__), 'supabase_migration.sql'),
+            encoding='utf-8'
+        ).read(), language='sql')
+        st.stop()
+
+    # ── No data yet ───────────────────────────────────────────────────────────
+    if not _raw_trades:
+        st.markdown("""
+<div style="background:linear-gradient(135deg,#111827,#0f172a);border:1px solid rgba(99,102,241,0.15);
+    border-radius:14px;padding:32px;text-align:center;margin-top:24px;">
+  <div style="font-size:32px;margin-bottom:12px;">🏆</div>
+  <div style="font-size:16px;color:#e2e8f0;font-family:'DM Mono',monospace;margin-bottom:8px;">
+    No trades logged yet
+  </div>
+  <div style="font-size:13px;color:#4b5563;font-family:'DM Sans',sans-serif;">
+    Execute your first paper trade from the Scanner tab to begin the self-improving loop.
+  </div>
+</div>""", unsafe_allow_html=True)
+        st.stop()
+
+    import pandas as _pd_perf
+
+    _df = _pd_perf.DataFrame(_raw_trades)
+    _df['entered_at'] = _pd_perf.to_datetime(_df['entered_at'], utc=True, errors='coerce')
+    _df['exited_at']  = _pd_perf.to_datetime(_df.get('exited_at'), utc=True, errors='coerce')
+
+    _closed = _df[_df['status'] == 'closed'].copy()
+    _open   = _df[_df['status'] == 'open'].copy()
+
+    # ── Summary row ───────────────────────────────────────────────────────────
+    _total  = len(_df)
+    _n_cl   = len(_closed)
+    _n_op   = len(_open)
+
+    if _n_cl > 0:
+        _wins       = (_closed['pnl_dollars'] > 0).sum()
+        _win_rate   = round(_wins / _n_cl * 100, 1)
+        _gross_gain = _closed.loc[_closed['pnl_dollars'] > 0, 'pnl_dollars'].sum()
+        _gross_loss = abs(_closed.loc[_closed['pnl_dollars'] < 0, 'pnl_dollars'].sum())
+        _pf         = round(_gross_gain / _gross_loss, 2) if _gross_loss > 0 else float('inf')
+        _net_pnl    = round(_closed['pnl_dollars'].sum(), 2)
+        _avg_peak   = round(_closed['peak_premium'].dropna().mean(), 4) if 'peak_premium' in _closed.columns else None
+    else:
+        _win_rate = _pf = _net_pnl = _gross_gain = _gross_loss = 0.0
+        _avg_peak = None
+
+    _pnl_color  = '#4ade80' if _net_pnl >= 0 else '#f87171'
+    _pf_color   = '#4ade80' if _pf >= 1.5 else ('#f59e0b' if _pf >= 1.0 else '#ef4444')
+    _wr_color   = '#4ade80' if _win_rate >= 55 else ('#f59e0b' if _win_rate >= 40 else '#ef4444')
+    _pf_display = f"{_pf:.2f}x" if _pf != float('inf') else "inf"
+
+    st.markdown(f"""
+<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px;">
+  <div style="background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;text-align:center;">
+    <div style="font-size:9px;color:#4b5563;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;">Trades Logged</div>
+    <div style="font-family:'DM Mono',monospace;font-size:24px;font-weight:700;color:#e2e8f0;">{_total}</div>
+    <div style="font-size:10px;color:#4b5563;">{_n_op} open · {_n_cl} closed</div>
+  </div>
+  <div style="background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;text-align:center;">
+    <div style="font-size:9px;color:#4b5563;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;">Win Rate</div>
+    <div style="font-family:'DM Mono',monospace;font-size:24px;font-weight:700;color:{_wr_color};">{_win_rate}%</div>
+    <div style="font-size:10px;color:#4b5563;">{int(_wins) if _n_cl>0 else 0}W / {_n_cl - int(_wins) if _n_cl>0 else 0}L</div>
+  </div>
+  <div style="background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;text-align:center;">
+    <div style="font-size:9px;color:#4b5563;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;">Profit Factor</div>
+    <div style="font-family:'DM Mono',monospace;font-size:24px;font-weight:700;color:{_pf_color};">{_pf_display}</div>
+    <div style="font-size:10px;color:#4b5563;">Gains / Losses</div>
+  </div>
+  <div style="background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;text-align:center;">
+    <div style="font-size:9px;color:#4b5563;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;">Net P&L</div>
+    <div style="font-family:'DM Mono',monospace;font-size:24px;font-weight:700;color:{_pnl_color};">{"+" if _net_pnl>=0 else ""}${_net_pnl:.2f}</div>
+    <div style="font-size:10px;color:#4b5563;">paper trades</div>
+  </div>
+  <div style="background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;text-align:center;">
+    <div style="font-size:9px;color:#4b5563;text-transform:uppercase;letter-spacing:2px;margin-bottom:6px;">Avg Peak</div>
+    <div style="font-family:'DM Mono',monospace;font-size:24px;font-weight:700;color:#a5b4fc;">${f"{_avg_peak:.4f}" if _avg_peak else "—"}</div>
+    <div style="font-size:10px;color:#4b5563;">HOD per runner</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # ── Win Rate by Regime ────────────────────────────────────────────────────
+    st.markdown("<div class='section-header' style='margin-top:8px;'>Win Rate by Regime</div>",
+                unsafe_allow_html=True)
+
+    _REGIME_ORDER  = ['Bull Quiet', 'Bull Volatile', 'Bear Quiet', 'Bear Volatile', 'Chop']
+    _REGIME_COLORS = {
+        'Bull Quiet':    '#4ade80', 'Bull Volatile':  '#86efac',
+        'Bear Quiet':    '#f87171', 'Bear Volatile':  '#fca5a5',
+        'Chop':          '#f59e0b',
+    }
+
+    if _n_cl > 0 and 'regime' in _closed.columns:
+        _by_regime = (
+            _closed.groupby('regime', dropna=False)
+            .agg(
+                total    = ('pnl_dollars', 'count'),
+                wins     = ('pnl_dollars', lambda x: (x > 0).sum()),
+                net_pnl  = ('pnl_dollars', 'sum'),
+                avg_peak = ('peak_premium', 'mean'),
+            )
+            .reset_index()
+        )
+        _by_regime['win_rate'] = (_by_regime['wins'] / _by_regime['total'] * 100).round(1)
+
+        _r_cols = st.columns(min(len(_by_regime), 5))
+        for _i, (_rc, (__, _row)) in enumerate(zip(_r_cols, _by_regime.iterrows())):
+            _rname   = str(_row['regime']) if _row['regime'] else 'Unknown'
+            _rcolor  = _REGIME_COLORS.get(_rname, '#6b7280')
+            _rwr     = _row['win_rate']
+            _rwr_clr = '#4ade80' if _rwr >= 55 else ('#f59e0b' if _rwr >= 40 else '#ef4444')
+            _rnpnl   = round(float(_row['net_pnl']), 2)
+            _rnpnl_c = '#4ade80' if _rnpnl >= 0 else '#f87171'
+            _rpeak   = f"${float(_row['avg_peak']):.4f}" if not _pd_perf.isna(_row['avg_peak']) else '—'
+            with _rc:
+                st.markdown(f"""
+<div style="background:#0f172a;border:1px solid {_rcolor}44;border-radius:12px;padding:14px;text-align:center;">
+  <div style="font-size:10px;color:{_rcolor};font-weight:700;font-family:'DM Mono',monospace;
+      margin-bottom:8px;">{_rname}</div>
+  <div style="font-size:22px;font-weight:700;color:{_rwr_clr};font-family:'DM Mono',monospace;">{_rwr}%</div>
+  <div style="font-size:10px;color:#4b5563;margin-top:2px;">{int(_row['wins'])}W / {int(_row['total']-_row['wins'])}L</div>
+  <div style="border-top:1px solid #1f2937;margin:8px 0;"></div>
+  <div style="font-size:10px;color:{_rnpnl_c};font-family:'DM Mono',monospace;">
+    {"+" if _rnpnl>=0 else ""}${_rnpnl:.2f} net
+  </div>
+  <div style="font-size:9px;color:#4b5563;margin-top:2px;">Avg Peak: {_rpeak}</div>
+</div>""", unsafe_allow_html=True)
+    else:
+        st.info("No closed trades yet — win rate will populate after your first exit.")
+
+    # ── Alpha Setup performance ───────────────────────────────────────────────
+    if _n_cl > 0 and 'alpha_setup' in _closed.columns:
+        _alpha_cl = _closed[_closed['alpha_setup'] == True]
+        _non_alpha = _closed[_closed['alpha_setup'] != True]
+        if len(_alpha_cl) > 0 or len(_non_alpha) > 0:
+            st.markdown("<div class='section-header' style='margin-top:24px;'>Alpha Setup vs Standard</div>",
+                        unsafe_allow_html=True)
+            _ac1, _ac2 = st.columns(2)
+            for _ac, _subset, _label, _clr in [
+                (_ac1, _alpha_cl,  "Alpha Setups",   '#fb923c'),
+                (_ac2, _non_alpha, "Standard Setups", '#6366f1'),
+            ]:
+                with _ac:
+                    if len(_subset) == 0:
+                        st.markdown(f"<div style='color:#4b5563;text-align:center;padding:20px;'>{_label}: no data</div>",
+                                    unsafe_allow_html=True)
+                        continue
+                    _aw   = (_subset['pnl_dollars'] > 0).sum()
+                    _awr  = round(_aw / len(_subset) * 100, 1)
+                    _anpnl = round(_subset['pnl_dollars'].sum(), 2)
+                    _aw_c = '#4ade80' if _awr >= 55 else ('#f59e0b' if _awr >= 40 else '#ef4444')
+                    st.markdown(f"""
+<div style="background:#0f172a;border:1px solid {_clr}44;border-radius:12px;padding:16px;text-align:center;">
+  <div style="font-size:10px;color:{_clr};font-weight:700;font-family:'DM Mono',monospace;margin-bottom:8px;">{_label}</div>
+  <div style="font-size:26px;font-weight:700;color:{_aw_c};font-family:'DM Mono',monospace;">{_awr}%</div>
+  <div style="font-size:10px;color:#4b5563;">{int(_aw)}W / {int(len(_subset)-_aw)}L · {len(_subset)} total</div>
+  <div style="font-size:11px;color:{'#4ade80' if _anpnl>=0 else '#f87171'};margin-top:6px;font-family:'DM Mono',monospace;">
+    Net: {"+" if _anpnl>=0 else ""}${_anpnl:.2f}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # ── Peak vs Exit ("Meat on the Bone") ─────────────────────────────────────
+    _guard_trades = _closed[
+        (_closed['peak_premium'].notna()) & (_closed['exit_premium'].notna()) &
+        (_closed['entry_premium'].notna())
+    ].copy() if _n_cl > 0 else _pd_perf.DataFrame()
+
+    if len(_guard_trades) > 0:
+        st.markdown("<div class='section-header' style='margin-top:24px;'>Profit Guard — Meat on the Bone</div>",
+                    unsafe_allow_html=True)
+        st.caption("Compares HOD (peak) vs actual exit to show how much was left behind by the 33% pullback rule.")
+        _guard_trades['captured_pct'] = (
+            (_guard_trades['exit_premium'] - _guard_trades['entry_premium']) /
+            (_guard_trades['peak_premium'] - _guard_trades['entry_premium'])
+            * 100
+        ).clip(0, 200).round(1)
+        _avg_cap = round(_guard_trades['captured_pct'].mean(), 1)
+        st.markdown(f"""
+<div style="background:#111827;border:1px solid rgba(165,180,252,0.2);border-radius:12px;
+    padding:14px 18px;margin-bottom:12px;">
+  <div style="font-size:10px;color:#6b7280;margin-bottom:4px;">Average Move Captured</div>
+  <div style="font-family:'DM Mono',monospace;font-size:20px;font-weight:700;color:#a5b4fc;">{_avg_cap}%</div>
+  <div style="font-size:10px;color:#4b5563;margin-top:2px;">of peak-to-entry move retained at exit</div>
+</div>""", unsafe_allow_html=True)
+        _gt_display = _guard_trades[['ticker', 'entry_premium', 'peak_premium', 'exit_premium', 'captured_pct', 'exit_reason']].copy()
+        _gt_display.columns = ['Ticker', 'Entry $', 'Peak $', 'Exit $', 'Captured %', 'Reason']
+        st.dataframe(_gt_display.style.format({
+            'Entry $': '{:.4f}', 'Peak $': '{:.4f}', 'Exit $': '{:.4f}', 'Captured %': '{:.1f}',
+        }), use_container_width=True, hide_index=True)
+
+    # ── Recent trades log ─────────────────────────────────────────────────────
+    st.markdown("<div class='section-header' style='margin-top:24px;'>Recent Trades</div>",
+                unsafe_allow_html=True)
+
+    _display_cols = [c for c in [
+        'entered_at', 'ticker', 'contract_type', 'strike', 'trade_type',
+        'regime', 'ftfc_aligned', 'ftfc_total', 'gap_type', 'alpha_setup',
+        'entry_premium', 'peak_premium', 'exit_premium', 'pnl_dollars', 'pnl_pct',
+        'exit_reason', 'status',
+    ] if c in _df.columns]
+
+    _df_display = _df[_display_cols].copy()
+    if 'entered_at' in _df_display.columns:
+        _df_display['entered_at'] = _df_display['entered_at'].dt.strftime('%m/%d %H:%M').fillna('—')
+
+    # Color the pnl_dollars column
+    def _color_pnl(val):
+        if val is None or (isinstance(val, float) and _pd_perf.isna(val)):
+            return ''
+        return 'color: #4ade80' if val > 0 else ('color: #f87171' if val < 0 else '')
+
+    st.dataframe(
+        _df_display.style.applymap(_color_pnl, subset=['pnl_dollars'] if 'pnl_dollars' in _df_display.columns else []),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ── Clear log ─────────────────────────────────────────────────────────────
+    with st.expander("Danger Zone", expanded=False):
+        if is_admin:
+            if st.button("Clear All Trade Logs", type="secondary"):
+                try:
+                    from config import supabase as _sb
+                    _sb.table('trade_log').delete().gte('id', 0).execute()
+                    st.success("Trade log cleared.")
+                    st.rerun()
+                except Exception as _ce:
+                    st.error(f"Clear failed: {_ce}")
+        else:
+            st.markdown(
+                '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
+                'border-radius:8px;padding:8px 14px;font-family:DM Mono,monospace;'
+                'font-size:11px;color:#374151;text-align:center;">'
+                '🔒 Execution Disabled — Read-Only Mode</div>',
+                unsafe_allow_html=True,
+            )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: DATABASE CONNECTION TEST
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "db_test":
+    show_tab_header("db_test", "🗄️ Database Connection Test", "Supabase Live Read")
+
+    from lib.db import fetch_recent_trades, get_db
+
+    # ── Mock data definition ──────────────────────────────────────────────────
+    def _mock_pnl_rows() -> list[dict]:
+        now = datetime.now()
+        def _row(ticker, direction, trade_type, grade, regime, entry, exit_, qty, note, days_ago, hour):
+            # entry/exit are option premiums; P&L is purely premium-in vs premium-out
+            pnl_pct    = round((exit_ - entry) / entry * 100, 3)
+            pnl_dollars = round((exit_ - entry) * qty * 100, 2)
+            ts = (now - timedelta(days=days_ago)).replace(hour=hour, minute=15, second=0, microsecond=0)
+            return {
+                "ticker": ticker, "direction": direction, "trade_type": trade_type,
+                "grade": grade, "regime": regime,
+                "entry_price": entry, "exit_price": exit_, "qty": qty,
+                "pnl_pct": pnl_pct, "pnl_dollars": pnl_dollars,
+                "win": pnl_pct > 0, "note": note,
+                "timestamp": ts.isoformat(), "date": ts.date().isoformat(),
+                "hour": hour, "day_of_week": ts.strftime("%A"),
+            }
+        return [
+            _row("NVDA", "LONG",  "0DTE_CALL",  "A+", "Bull_Quiet",    3.20,  8.75, 2, "Breakout on vol surge — rode to target",  1, 10),
+            _row("SPY",  "SHORT", "0DTE_PUT",   "A",  "Bear_Volatile", 2.15,  0.60, 3, "SPY reclaimed VWAP, put collapsed",       2, 11),
+            _row("TSLA", "LONG",  "SWING_LONG", "A",  "Bull_Quiet",    6.40, 11.25, 2, "Held through catalyst, 2-1-2 confirmed",  3,  9),
+            _row("QQQ",  "SHORT", "0DTE_PUT",   "B",  "Bear_Quiet",    1.80,  3.95, 2, "Clean 3-2 continuation breakdown",        4, 14),
+            _row("AAPL", "LONG",  "0DTE_CALL",  "A",  "Bull_Volatile", 4.50,  1.80, 2, "Stopped out on macro spike reversal",     5, 10),
+        ]
+
+    def _mock_tracker_rows() -> list[dict]:
+        now = datetime.now()
+        def _row(ticker, grade, direction, regime, score, entry, current, trade_type, patterns, note, mins_ago):
+            # entry/current are option premiums
+            pnl_pct    = round((current - entry) / entry * 100, 3)
+            pnl_dollars = round((current - entry) * 100, 2)
+            added = (now - timedelta(minutes=mins_ago)).isoformat()
+            return {
+                "ticker": ticker, "grade": grade, "direction": direction,
+                "regime": regime, "signal_score": score,
+                "entry_price": entry, "trade_type": trade_type,
+                "patterns": patterns, "note": note,
+                "added_at": added, "active": True,
+                "current_price": current,
+                "pnl_dollars": pnl_dollars, "pnl_pct": pnl_pct,
+                "last_updated": now.isoformat(),
+            }
+        return [
+            _row("NVDA", "A+", "LONG",  "Bull_Quiet",    85, 4.50, 6.80, "0DTE",  [{"name": "2-1-2 Cont", "direction": "up",   "grade": "A+"}], "Running — at +51%, watching $7",  42),
+            _row("SPY",  "A",  "SHORT", "Bear_Volatile", 72, 3.80, 5.15, "SWING", [{"name": "3-2 Cont",   "direction": "down", "grade": "A"}],  "Put gaining as SPY breaks down",  18),
+            _row("MU",   "A",  "LONG",  "Bull_Quiet",    68, 1.95, 1.30, "0DTE",  [{"name": "2-1-2 Rev",  "direction": "up",   "grade": "A"}],  "Gone against — monitoring stop",  95),
+            _row("QQQ",  "B",  "LONG",  "Bull_Volatile", 54, 7.20, 7.85, "SWING", [{"name": "2-2 Rev",    "direction": "up",   "grade": "B"}],  "Small size in chop — up slightly", 130),
+        ]
+
+    # ── Generate Mock Data button ─────────────────────────────────────────────
+    st.markdown("#### Seed Test Data")
+    mock_col1, mock_col2, mock_col3 = st.columns([2, 2, 4])
+
+    if is_admin:
+        with mock_col1:
+            gen_clicked = st.button("⚡ Generate Mock Data", use_container_width=True, type="primary")
+        with mock_col2:
+            clear_clicked = st.button("🗑️ Clear Mock Data", use_container_width=True, type="secondary")
+    else:
+        gen_clicked = False
+        clear_clicked = False
+        with mock_col1:
+            st.markdown(
+                '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
+                'border-radius:8px;padding:8px 14px;font-family:DM Mono,monospace;'
+                'font-size:11px;color:#374151;text-align:center;">'
+                '🔒 Execution Disabled — Read-Only Mode</div>',
+                unsafe_allow_html=True,
+            )
+
+    if gen_clicked:
+        db = get_db()
+        errors = []
+        try:
+            db.table("pnl_history").insert(_mock_pnl_rows()).execute()
+        except Exception as e:
+            errors.append(f"pnl_history: {e}")
+        try:
+            db.table("tracker_positions").insert(_mock_tracker_rows()).execute()
+        except Exception as e:
+            errors.append(f"tracker_positions: {e}")
+
+        if errors:
+            st.error("Insert failed: " + " | ".join(errors))
+        else:
+            st.success("✅ Inserted 5 rows → pnl_history  and  4 rows → tracker_positions. Select a table below to view.")
+            st.rerun()
+
+    if clear_clicked:
+        db = get_db()
+        errors = []
+        try:
+            db.table("pnl_history").delete().neq("id", 0).execute()
+        except Exception as e:
+            errors.append(f"pnl_history: {e}")
+        try:
+            db.table("tracker_positions").delete().neq("id", 0).execute()
+        except Exception as e:
+            errors.append(f"tracker_positions: {e}")
+
+        if errors:
+            st.error("Clear failed: " + " | ".join(errors))
+        else:
+            st.success("🗑️ All rows cleared from pnl_history and tracker_positions.")
+            st.rerun()
+
+    st.markdown("---")
+
+    # ── Table selector ────────────────────────────────────────────────────────
+    TABLE_META = {
+        "pnl_history":       {"date_col": "date",      "order_col": "timestamp",  "label": "Trade Log (P&L History)"},
+        "tracker_positions": {"date_col": None,         "order_col": "added_at",   "label": "Tracker Positions"},
+        "alerts":            {"date_col": None,         "order_col": "timestamp",  "label": "Alerts"},
+        "scan_history":      {"date_col": "scan_date",  "order_col": "scan_date",  "label": "Scan History"},
+        "universe_members":  {"date_col": None,         "order_col": "added_at",   "label": "Universe Members"},
+    }
+
+    selected_table = st.selectbox(
+        "Select table to inspect",
+        list(TABLE_META.keys()),
+        format_func=lambda k: TABLE_META[k]["label"],
+    )
+    row_limit = st.slider("Rows to fetch", min_value=5, max_value=100, value=20, step=5)
+
+    meta = TABLE_META[selected_table]
+
+    with st.spinner(f"Reading from `{selected_table}`..."):
+        rows, source_label = fetch_recent_trades(
+            table=selected_table,
+            limit=row_limit,
+            date_col=meta["date_col"],
+            order_col=meta["order_col"],
+        )
+
+    # ── Status banner ────────────────────────────────────────────────────────
+    if rows:
+        source_color = "#22c55e" if source_label == "today" else "#f59e0b"
+        source_icon  = "✅" if source_label == "today" else "📅"
+        st.markdown(
+            f"<div style='background:#0d1f12;border:1px solid {source_color}33;"
+            f"border-radius:10px;padding:14px 18px;margin-bottom:16px;'>"
+            f"<span style='color:{source_color};font-weight:700;font-size:14px;'>"
+            f"{source_icon} Supabase connected — showing <code style='color:{source_color}'>{source_label}</code> "
+            f"data &nbsp;·&nbsp; {len(rows)} row{'s' if len(rows) != 1 else ''} from "
+            f"<code style='color:{source_color}'>{selected_table}</code></span></div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div style='background:#1f0d0d;border:1px solid #ef444433;"
+            "border-radius:10px;padding:14px 18px;margin-bottom:16px;'>"
+            "<span style='color:#ef4444;font-weight:700;font-size:14px;'>"
+            "⚠️ No data found — table may be empty or RLS is blocking reads.</span></div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Data table ───────────────────────────────────────────────────────────
+    if rows:
+        df = pd.DataFrame(rows)
+
+        # Number formatting
+        fmt = {}
+        for col in ["entry_price", "exit_price", "current_price", "pnl_dollars"]:
+            if col in df.columns:
+                fmt[col] = "${:.2f}"
+        if "pnl_pct" in df.columns:
+            fmt["pnl_pct"] = "{:+.2f}%"
+
+        styled = df.style.format(fmt, na_rep="—")
+
+        # Green / red colouring on P&L columns
+        def _pnl_colour(val):
+            try:
+                v = float(str(val).replace("$", "").replace("%", "").replace("+", ""))
+            except (ValueError, TypeError):
+                return ""
+            return "color: #22c55e; font-weight: 600" if v > 0 else "color: #ef4444; font-weight: 600"
+
+        for col in ["pnl_dollars", "pnl_pct"]:
+            if col in df.columns:
+                styled = styled.applymap(_pnl_colour, subset=[col])
+
+        if "win" in df.columns:
+            styled = styled.applymap(
+                lambda v: "color: #22c55e" if v is True else ("color: #ef4444" if v is False else ""),
+                subset=["win"],
+            )
+
+        # st.dataframe is interactive by default — columns are drag-to-reorder
+        st.dataframe(styled, use_container_width=True, height=min(600, 40 + len(df) * 35))
+        st.caption(f"{len(df)} rows · {len(df.columns)} columns · drag column headers to reorder · source: {source_label}")
+    else:
+        st.info("Nothing to display. Click ⚡ Generate Mock Data above, then select a table.")
