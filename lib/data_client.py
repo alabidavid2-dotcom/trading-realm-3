@@ -99,52 +99,60 @@ def get_auth_debug_info() -> dict:
 
 
 def _fetch(ticker: str, timeframe, start: datetime, end: datetime = None) -> pd.DataFrame:
-    """Core fetch — returns clean OHLCV DataFrame; empty DataFrame on any error."""
+    """Core fetch — returns clean OHLCV DataFrame; empty DataFrame on any error.
+    Retries up to 3 times on 429 rate-limit responses with exponential backoff."""
+    import time as _time
     from alpaca.data.requests import StockBarsRequest
     from config import DATA_FEED
 
     if end is None:
         end = datetime.now() + timedelta(days=1)
 
-    try:
-        client = _get_client()
-        req = StockBarsRequest(
-            symbol_or_symbols=ticker,
-            timeframe=timeframe,
-            start=start,
-            end=end,
-            feed=DATA_FEED,
-        )
-        bars = client.get_stock_bars(req)
-        if not bars or not bars.data:
+    for _attempt in range(3):
+        try:
+            client = _get_client()
+            req = StockBarsRequest(
+                symbol_or_symbols=ticker,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+                feed=DATA_FEED,
+            )
+            bars = client.get_stock_bars(req)
+            if not bars or not bars.data:
+                return pd.DataFrame()
+
+            df = bars.df
+            if df is None or df.empty:
+                return pd.DataFrame()
+
+            # Drop symbol level from MultiIndex (symbol, timestamp) → (timestamp,)
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.reset_index(level=0, drop=True)
+
+            # Strip timezone info
+            if hasattr(df.index, 'tz') and df.index.tz is not None:
+                df.index = df.index.tz_convert(None)
+            df.index = pd.to_datetime(df.index)
+
+            # Normalise column names to Title Case
+            df = df.rename(columns={
+                'open': 'Open', 'high': 'High', 'low': 'Low',
+                'close': 'Close', 'volume': 'Volume',
+            })
+
+            keep = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in df.columns]
+            return df[keep]
+
+        except Exception as _e:
+            _fetch._last_error = str(_e)
+            # Retry on rate-limit (429); surface all other errors immediately
+            if '429' in str(_e) or 'rate limit' in str(_e).lower() or 'too many' in str(_e).lower():
+                _time.sleep(2 ** _attempt)   # 1s → 2s → 4s backoff
+                continue
             return pd.DataFrame()
 
-        df = bars.df
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        # Drop symbol level from MultiIndex (symbol, timestamp) → (timestamp,)
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.reset_index(level=0, drop=True)
-
-        # Strip timezone info
-        if hasattr(df.index, 'tz') and df.index.tz is not None:
-            df.index = df.index.tz_convert(None)
-        df.index = pd.to_datetime(df.index)
-
-        # Normalise column names to Title Case
-        df = df.rename(columns={
-            'open': 'Open', 'high': 'High', 'low': 'Low',
-            'close': 'Close', 'volume': 'Volume',
-        })
-
-        keep = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in df.columns]
-        return df[keep]
-
-    except Exception as _e:
-        # Surface the raw error so 401s are visible in the FTFC debug expander
-        _fetch._last_error = str(_e)
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 
 # ── Public helpers ───────────────────────────────────────────────────────────────
@@ -233,9 +241,11 @@ def get_ftfc_snapshot(ticker: str, mode: str = 'intraday') -> list[dict]:
     swing_specs = intraday_specs[:4]   # swing uses M/W/D/4H only
     specs = intraday_specs if mode == 'intraday' else swing_specs
 
+    import time as _time
     result = []
     errors = []
     for name, fetch_fn in specs:
+        _time.sleep(0.05)   # 50ms stagger between timeframe calls — keeps burst ≤ 20 req/sec per worker
         try:
             df = fetch_fn()
             if df.empty or 'Open' not in df.columns or 'Close' not in df.columns:

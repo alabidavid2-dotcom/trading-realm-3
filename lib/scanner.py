@@ -471,7 +471,7 @@ def run_watchlist_scan(tickers: list = None, timeout_secs: float = 7.5, progress
     if progress_callback:
         progress_callback("ftfc", 0, len(tickers),
             f"FTFC in parallel ({len(tickers)} tickers + {len(sector_etfs)} sector ETFs, {ftfc_budget:.1f}s budget)...")
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:   # 4 workers × 7 calls = 28 concurrent max
         future_map = {executor.submit(get_ftfc_snapshot, t, 'intraday'): t for t in all_fetch_targets}
         done_futs, pending_futs = cf_wait(list(future_map), timeout=ftfc_budget)
         for fut in done_futs:

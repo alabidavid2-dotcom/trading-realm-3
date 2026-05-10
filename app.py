@@ -1376,6 +1376,8 @@ def log_order(result: dict):
     if 'order_log' not in st.session_state:
         st.session_state.order_log = []
     st.session_state.order_log.insert(0, result)
+    if len(st.session_state.order_log) > 500:
+        st.session_state.order_log = st.session_state.order_log[:500]
 
 
 def render_daily_loss_gate():
@@ -2896,6 +2898,8 @@ elif page == "live":
                             'type': 'runner_exit', 'symbol': _run_sym,
                             'message': log_msg,
                         })
+                        if len(st.session_state.order_log) > 500:
+                            st.session_state.order_log = st.session_state.order_log[-500:]
                     # Log exit to Supabase — include peak_premium so we can measure "meat on the bone"
                     if TRADE_LOG_AVAILABLE:
                         log_trade_exit(
@@ -2954,6 +2958,8 @@ elif page == "live":
                             'type': 'runner_exit', 'symbol': _run_sym,
                             'message': f"Runner Closed: Manual (Peak ${_run_hod:.2f})",
                         })
+                        if len(st.session_state.order_log) > 500:
+                            st.session_state.order_log = st.session_state.order_log[-500:]
                     if TRADE_LOG_AVAILABLE:
                         log_trade_exit(
                             occ_symbol    = _run_sym,
