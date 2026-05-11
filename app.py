@@ -1508,7 +1508,7 @@ def render_daily_loss_gate():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if page == "ticker":
-    show_tab_header("ticker", f"📊 {ticker}", datetime.now().strftime('%B %d, %Y'))
+    show_tab_header("ticker", "Trading Realm", "")
     render_daily_loss_gate()
 
     # ── Live Quote Search ──────────────────────────────────────────────────────
@@ -2227,6 +2227,187 @@ elif page == "scanner":
                 unsafe_allow_html=True,
             )
 
+    # ── Card builder: page-scope so Fast Watchlist AND Full S&P scan can use it ─
+    def _make_card_html(cv, art_html='', decayed=False):
+        d         = cv['dir']
+        ptr       = cv['ptr']
+        hp_color  = '#22c55e' if ptr >= 70 else ('#f59e0b' if ptr >= 40 else '#ef4444')
+        hp_w      = str(max(0, min(100, ptr))) + '%'
+        dir_color = '#4ade80' if d == 'LONG' else ('#f87171' if d == 'SHORT' else '#6b7280')
+        dir_arrow = '▲' if d == 'LONG' else ('▼' if d == 'SHORT' else '—')
+        ps        = ('$' + str(cv['price'])) if cv['price'] else '—'
+        if decayed:
+            card_cls     = 'trade-card decayed-card'
+            decay_banner = (
+                '<div class="tc-decay-banner">'
+                '<div style="font-family:\'DM Mono\',monospace;font-size:10px;font-weight:700;'
+                'color:#ef4444;letter-spacing:2px;text-transform:uppercase;">'
+                '&#9888; DECAYED ALPHA | SUPER EFFECTIVE (-)</div>'
+                '<div style="font-family:\'DM Mono\',monospace;font-size:9px;color:#7f1d1d;'
+                'margin-top:2px;letter-spacing:1px;">MOVE PASSED &#8212; DO NOT CHASE</div>'
+                '</div>'
+            )
+            static_overlay = '<div class="tc-static-overlay"></div>'
+        else:
+            card_cls       = 'trade-card alpha-glow' if cv.get('alpha_setup') else 'trade-card'
+            decay_banner   = ''
+            static_overlay = ''
+        sec_etf = cv.get('sector_etf', '')
+        sec_dir = cv.get('sector_dir', 'neutral')
+        if sec_etf:
+            sec_c = '#4ade80' if sec_dir == 'up' else ('#f87171' if sec_dir == 'down' else '#6b7280')
+            sec_a = '▲' if sec_dir == 'up' else ('▼' if sec_dir == 'down' else '—')
+            sec_badge = (
+                '<span style="background:#111827;color:' + sec_c + ';border-radius:4px;'
+                'padding:1px 6px;font-size:9px;font-family:\'DM Mono\',monospace;font-weight:600;">'
+                + sec_etf + ' ' + sec_a + '</span>'
+            )
+        else:
+            sec_badge = ''
+        div_tag = (
+            '<span style="color:#f59e0b;font-size:9px;font-family:\'DM Mono\',monospace;">'
+            '⚠ Div</span>'
+        ) if cv.get('sector_div') else ''
+        tf_names = ['Monthly', 'Weekly', 'Daily', '4H', '60min', '15min', '5min']
+        tf_short = ['M', 'W', 'D', '4H', '60', '15', '5']
+        stack    = cv.get('ftfc_stack', [])
+        tf_map   = {t.get('tf'): t for t in stack}
+        e_html   = '<div class="tc-energy-row"><span class="tc-energy-label">FTFC</span>'
+        for tfn, tfs in zip(tf_names, tf_short):
+            tfd   = tf_map.get(tfn, {}).get('direction', 'neutral')
+            dot_c = '#22c55e' if tfd == 'up' else ('#ef4444' if tfd == 'down' else '#1e2433')
+            bdr_c = '#166534' if tfd == 'up' else ('#7f1d1d' if tfd == 'down' else '#374151')
+            e_html += (
+                '<div class="tc-energy-dot">'
+                '<div style="width:12px;height:12px;border-radius:50%;background:' + dot_c + ';'
+                'border:1.5px solid ' + bdr_c + ';"></div>'
+                '<span style="font-size:7px;color:#374151;font-family:\'DM Mono\',monospace;">'
+                + tfs + '</span></div>'
+            )
+        e_html += '</div>'
+        gap_type    = cv.get('gap_type', 'No Gap')
+        gap_pct     = cv.get('gap_pct', 0.0)
+        gap_c       = '#4ade80' if 'Up' in gap_type else ('#f87171' if 'Down' in gap_type else '#6b7280')
+        gap_icon    = '⚡' if 'Up' in gap_type else ('⬇' if 'Down' in gap_type else '◦')
+        gap_pct_str = (('+' if gap_pct > 0 else '') + str(round(gap_pct, 1)) + '%') if abs(gap_pct) > 0.01 else ''
+        exec_str    = 'BUY CALL' if d == 'LONG' else ('BUY PUT' if d == 'SHORT' else '—')
+        ss          = (' +' + str(cv['sentinel_bonus']) + ' Sentinel') if cv.get('sentinel_bonus') else ''
+        alpha_badge = (
+            '<div style="text-align:center;font-size:11px;color:#fb923c;'
+            'font-family:\'DM Mono\',monospace;font-weight:700;letter-spacing:1px;'
+            'padding:5px 0 1px 0;">\U0001f525 ALPHA SETUP</div>'
+        ) if (cv.get('alpha_setup') and not decayed) else ''
+        return (
+            '<div class="' + card_cls + '">'
+            + static_overlay + decay_banner +
+            '<div class="tc-glare"></div>'
+            '<div class="tc-foil"></div>'
+            '<div class="tc-inner">'
+            '<div class="tc-header">'
+            '<div>'
+            '<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;">'
+            '<span style="font-size:18px;color:' + dir_color + ';">' + dir_arrow + '</span>'
+            '<span class="tc-name">' + cv['sym'] + '</span>'
+            '</div>'
+            '<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;">'
+            + sec_badge + cv.get('gap_badge_html', '') + div_tag +
+            '<span style="color:#6b7280;font-family:\'DM Mono\',monospace;font-size:11px;">'
+            + ps + ' ' + cv['chg_str'] + '</span>'
+            '</div></div>'
+            '<div class="tc-hp-col">'
+            '<div style="font-size:9px;color:#4b5563;font-family:\'DM Mono\',monospace;'
+            'letter-spacing:1px;text-align:right;margin-bottom:2px;">HP</div>'
+            '<div class="tc-hp-num" style="color:' + hp_color + ';">' + str(ptr) + '</div>'
+            '<div style="background:#0d1117;border-radius:3px;width:56px;height:4px;'
+            'overflow:hidden;margin:3px 0 0 auto;">'
+            '<div style="width:' + hp_w + ';height:100%;background:' + hp_color + ';border-radius:3px;"></div>'
+            '</div>'
+            '<div style="font-size:8px;color:#374151;font-family:\'DM Mono\',monospace;'
+            'text-align:right;margin-top:3px;">' + cv.get('scan_time', '') + '</div>'
+            '</div></div>'
+            '<div class="tc-art-box">' + art_html + '</div>'
+            + e_html +
+            '<div class="tc-moves">'
+            '<div class="tc-move-line">'
+            '<span style="color:' + gap_c + ';">' + gap_icon + '</span>'
+            '<span style="color:' + gap_c + ';font-weight:700;">' + gap_type + '</span>'
+            + ('<span style="color:#6b7280;"> ' + gap_pct_str + '</span>' if gap_pct_str else '') +
+            '</div>'
+            '<div class="tc-move-line">'
+            '<span style="color:#818cf8;">⚔</span>'
+            '<span style="color:#c4b5fd;font-weight:700;">' + exec_str + '</span>'
+            + ('<span style="color:#fb923c;font-size:9px;"> ' + ss + '</span>' if ss else '') +
+            '</div></div>'
+            '<div class="tc-footer">'
+            '<span class="tc-footer-tag">Paper Trade</span>'
+            '<span class="tc-footer-tag" style="color:#6366f1;">33% Guard ☑</span>'
+            '</div>'
+            + alpha_badge +
+            '</div></div>'
+        )
+
+    _SKELETON_ART = (
+        '<div style="width:100%;height:72px;position:relative;'
+        'background:linear-gradient(90deg,#0d1117 25%,#1a2332 50%,#0d1117 75%);'
+        'background-size:200% 100%;animation:tr-shimmer 1.5s ease-in-out infinite;">'
+        '<div style="position:absolute;inset:0;display:flex;align-items:center;'
+        'justify-content:center;">'
+        '<span style="font-family:\'DM Mono\',monospace;font-size:9px;color:#374151;'
+        'letter-spacing:2px;">LOADING CHART...</span>'
+        '</div></div>'
+    )
+
+    def _cv_from_history(r):
+        """Map Full S&P scan history dict → _make_card_html cv dict."""
+        _g            = r.get('grade', {}) or {}
+        _gap_raw      = r.get('gap', {}) or {}
+        _gap_raw_type = _gap_raw.get('gap_type', '')
+        _gap_pct      = float(_gap_raw.get('gap_pct', 0.0))
+        _gap_type_map = {
+            'strong_up':    'Full Up',
+            'moderate_up':  'Partial Up',
+            'strong_down':  'Full Down',
+            'moderate_down': 'Partial Down',
+        }
+        _gap_type = _gap_type_map.get(_gap_raw_type, 'No Gap')
+        _gap_badge_lookup = {
+            'Full Up':      ('FG-UP', '#4ade80', '#14532d'),
+            'Partial Up':   ('PG-UP', '#86efac', '#1a2e1a'),
+            'Full Down':    ('FG-DN', '#f87171', '#7f1d1d'),
+            'Partial Down': ('PG-DN', '#fca5a5', '#3a1212'),
+        }
+        if _gap_type in _gap_badge_lookup:
+            _gl, _gc, _gbg = _gap_badge_lookup[_gap_type]
+            _gap_sign = '+' if _gap_pct > 0 else ''
+            _gap_badge_html = (
+                f'<span style="background:{_gbg};color:{_gc};border-radius:6px;'
+                f'padding:1px 6px;font-size:9px;font-family:\'DM Mono\',monospace;font-weight:600;">'
+                f'{_gl} {_gap_sign}{_gap_pct:.1f}%</span>'
+            )
+        else:
+            _gap_badge_html = ''
+        _ptr       = max(0, min(100, abs(int(r.get('composite', 0)))))
+        _direction = r.get('direction', 'FLAT')
+        _alpha     = _g.get('grade_intraday', '') in ('A+', 'A')
+        return {
+            'sym':            r.get('ticker', ''),
+            'price':          r.get('close'),
+            'dir':            _direction,
+            'ptr':            _ptr,
+            'chg_str':        '—',
+            'chg_color':      '#6b7280',
+            'alpha_setup':    _alpha,
+            'sector_etf':     '',
+            'sector_dir':     'neutral',
+            'sector_div':     False,
+            'gap_type':       _gap_type,
+            'gap_pct':        _gap_pct,
+            'gap_badge_html': _gap_badge_html,
+            'ftfc_stack':     [],
+            'sentinel_bonus': 0,
+            'scan_time':      r.get('scan_time', ''),
+        }
+
     # ── Fast Scan Results Display ─────────────────────────────────────────────
     _fsr = st.session_state.get('fast_scan_results')
     if _fsr and _fsr.get('results'):
@@ -2874,45 +3055,19 @@ elif page == "scanner":
                     elif gap_type == 'moderate_down':
                         gap_badge = f'<span style="background:#3a1e1e;color:#fca5a5;border-radius:6px;padding:2px 7px;font-size:10px;font-family:\'DM Mono\',monospace;">↓ gap {gap_pct:.1f}%</span>'
 
-                    st.markdown(f"""
-                    <div style="background:linear-gradient(135deg,#111827,#0f172a);border:1px solid rgba(99,102,241,0.15);
-                        border-radius:14px;padding:16px 20px;margin:4px 0;">
-                        <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;">
-                            <span style="font-size:22px;color:{arrow_color};">{arrow}</span>
-                            <span style="font-family:'DM Mono',monospace;font-size:20px;font-weight:700;color:#e2e8f0;">{sym}</span>
-                            <span style="color:#4b5563;font-family:'DM Mono',monospace;font-size:14px;">${price}</span>
-                            <span class="regime-badge regime-{regime_r.lower().replace(' ','_')}" style="font-size:11px;padding:3px 10px;">{regime_r}</span>
-                            <span style="color:#4b5563;font-size:12px;">{r.get('confidence',0)}% conf</span>
-                            {gap_badge}
-                            <span style="margin-left:auto;color:#374151;font-size:11px;">{r.get('scan_time','')}</span>
-                        </div>
-                        <div style="display:flex;gap:16px;margin-bottom:8px;">
-                            <div style="flex:1;background:#07080d;border-radius:10px;padding:12px;text-align:center;">
-                                <div style="font-size:10px;color:#4b5563;text-transform:uppercase;letter-spacing:1px;">Intraday 0DTE</div>
-                                <div style="display:flex;align-items:center;justify-content:center;gap:8px;margin:6px 0;">
-                                    <span style="display:inline-block;padding:3px 12px;border-radius:12px;font-family:'DM Mono',monospace;font-size:14px;font-weight:700;{grade_css_style(gi)}">{gi}</span>
-                                    <span style="font-family:'DM Mono',monospace;font-size:13px;color:{arrow_color};font-weight:600;">{ti}</span>
-                                </div>
-                                <div style="font-size:11px;color:#4b5563;">Risk: ${ri_val} | {ci} contracts</div>
-                            </div>
-                            <div style="flex:1;background:#07080d;border-radius:10px;padding:12px;text-align:center;">
-                                <div style="font-size:10px;color:#4b5563;text-transform:uppercase;letter-spacing:1px;">Swing Trade</div>
-                                <div style="display:flex;align-items:center;justify-content:center;gap:8px;margin:6px 0;">
-                                    <span style="display:inline-block;padding:3px 12px;border-radius:12px;font-family:'DM Mono',monospace;font-size:14px;font-weight:700;{grade_css_style(gs)}">{gs}</span>
-                                    <span style="font-family:'DM Mono',monospace;font-size:13px;color:{arrow_color};font-weight:600;">{ts_val}</span>
-                                </div>
-                                <div style="font-size:11px;color:#4b5563;">Risk: ${rs_val} | {cs} contracts</div>
-                            </div>
-                            <div style="flex:1;background:#07080d;border-radius:10px;padding:12px;">
-                                <div style="font-size:10px;color:#4b5563;text-transform:uppercase;letter-spacing:1px;">Confirmation</div>
-                                <div style="font-size:12px;color:#94a3b8;margin-top:6px;font-family:'DM Mono',monospace;">
-                                    FTC: {ftc_txt}<br>Sector: {sec_txt}<br>ATR: {atr_txt}
-                                </div>
-                            </div>
-                        </div>
-                        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:4px;">{pats_html}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    _cv_hist = _cv_from_history(r)
+                    _fsc_ph  = st.empty()
+                    _fsc_ph.markdown(_make_card_html(_cv_hist, _SKELETON_ART), unsafe_allow_html=True)
+                    _fsc_b64 = generate_sparkline_base64(sym)
+                    if _fsc_b64:
+                        _fsc_ph.markdown(
+                            _make_card_html(
+                                _cv_hist,
+                                '<img src="data:image/png;base64,' + _fsc_b64 + '" '
+                                'style="width:100%;height:80px;object-fit:fill;display:block;" />',
+                            ),
+                            unsafe_allow_html=True,
+                        )
 
                     # ── Options contract estimate ──────────────────────────────
                     if TRACKER_AVAILABLE and is_executable_grade(gi):
