@@ -300,17 +300,30 @@ class Executor:
     def kill_switch_0dte(self, swing_tickers: list = None) -> int:
         """
         EOD liquidation: close all 0DTE (options) positions, skip swing equity.
-        Delegates to lib.kill_switch.close_0dte_positions for filtering logic.
+        Pre-checks live positions first — safe to call on an already-flat account
+        (returns 0 without touching the broker API).
         Returns the number of positions closed.
         """
         from lib.kill_switch import close_0dte_positions
+
+        # Pre-flight: if account is already flat, skip entirely
+        try:
+            live_positions = self.get_positions()
+        except Exception as _e:
+            print(f"[KillSwitch] Could not fetch positions: {_e}")
+            return 0
+
+        if not live_positions:
+            print("[KillSwitch] Account already flat — no action needed.")
+            return 0
+
         result = close_0dte_positions(self, swing_tickers=swing_tickers or [])
         n = len(result['closed'])
         if result['skipped']:
-            print(f"[KillSwitch] Skipped swing positions: {result['skipped']}")
+            print(f"[KillSwitch] Swing positions preserved: {result['skipped']}")
         if result['errors']:
-            print(f"[KillSwitch] Errors: {result['errors']}")
-        print(f"[KillSwitch] EOD 0DTE close complete — {n} closed, "
+            print(f"[KillSwitch] Errors during close: {result['errors']}")
+        print(f"[KillSwitch] EOD complete — {n} closed, "
               f"{len(result['skipped'])} swing preserved, {len(result['errors'])} errors.")
         return n
 

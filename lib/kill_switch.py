@@ -74,18 +74,21 @@ def get_eod_status() -> dict:
 
 def close_0dte_positions(executor, swing_tickers: list | None = None) -> dict:
     """
-    Close open options positions (0DTE assets) while preserving swing equity.
+    Close open options (0DTE) positions while preserving ALL equity positions.
 
-    Rules
-    -----
-    - Positions whose asset_class contains 'option' → always closed.
-    - Equity positions whose symbol is in swing_tickers → skipped (overnight hold).
-    - All other equity → closed (intraday equity that should not roll overnight).
+    Safety-first rules
+    ------------------
+    - asset_class contains 'option' → close (these are 0DTE contracts).
+    - asset_class is equity (anything without 'option') → ALWAYS skip.
+      Equity held intraday is still safer to skip than to accidentally close
+      a manual swing position. Options are the only thing that MUST expire today.
+    - swing_tickers is kept as an extra explicit safeguard but is no longer
+      the sole protection for equity — even untagged equity is preserved.
 
     Parameters
     ----------
     executor      : Executor instance (from lib/executor.py)
-    swing_tickers : list of ticker symbols explicitly flagged as SWING
+    swing_tickers : list of tickers flagged SWING in the session order log
 
     Returns
     -------
@@ -109,8 +112,8 @@ def close_0dte_positions(executor, swing_tickers: list | None = None) -> dict:
         asset_class = str(getattr(pos, 'asset_class', '')).lower()
         is_option   = 'option' in asset_class
 
-        # Swing equity flagged explicitly — hold overnight, never touch
-        if not is_option and sym in swing_set:
+        # Equity: ALWAYS skip — never risk closing a manual or swing equity hold
+        if not is_option:
             skipped.append(sym)
             continue
 

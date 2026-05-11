@@ -1220,12 +1220,27 @@ with st.sidebar:
         # ── Market Mood (HMM Regime) ──────────────────────────────────────────────
         if REGIME_ENGINE_AVAILABLE and _hmm_model_exists():
             if 'sidebar_regime' not in st.session_state:
-                st.session_state.sidebar_regime = None
-            if st.session_state.sidebar_regime is None:
+                st.session_state.sidebar_regime      = None
+                st.session_state.sidebar_regime_ts   = 0
+            _regime_age = time.time() - st.session_state.get('sidebar_regime_ts', 0)
+            # Refresh if: never fetched, errored last time, or cache is > 5 min old
+            _regime_is_stale = (
+                st.session_state.sidebar_regime is None
+                or st.session_state.sidebar_regime.get('error')
+                or _regime_age > 300
+            )
+            if _regime_is_stale:
                 try:
-                    st.session_state.sidebar_regime = _hmm_get_regime()
+                    _fresh = _hmm_get_regime()
+                    if _fresh and not _fresh.get('error'):
+                        st.session_state.sidebar_regime    = _fresh
+                        st.session_state.sidebar_regime_ts = time.time()
+                    elif st.session_state.sidebar_regime is None:
+                        st.session_state.sidebar_regime = _fresh or {}
+                    # On error, keep last known good regime — don't overwrite with error dict
                 except Exception:
-                    st.session_state.sidebar_regime = {}
+                    if st.session_state.sidebar_regime is None:
+                        st.session_state.sidebar_regime = {}
 
             _sr = st.session_state.sidebar_regime or {}
             _sr_regime  = _sr.get('regime', 'Unknown')
@@ -2112,7 +2127,17 @@ elif page == "scanner":
 
     # ── Pulse Scan: re-check active tickers for decay ────────────────────────
     if st.session_state.active_tickers:
-        if is_admin:
+        if _eod_hard_close:
+            # After 15:50 the Kill Switch has already liquidated — pulse is meaningless
+            _pulse_clicked = False
+            st.markdown(
+                '<div style="background:#1c0a0a;border:1px solid rgba(239,68,68,0.35);'
+                'border-radius:8px;padding:10px;font-family:DM Mono,monospace;'
+                'font-size:11px;color:#f87171;text-align:center;margin:8px 0;">'
+                '&#9888; BATTLE STATIONS offline — EOD Kill Switch active. Positions liquidated.</div>',
+                unsafe_allow_html=True,
+            )
+        elif is_admin:
             _pulse_clicked = st.button(
                 f"⚡ BATTLE STATIONS: PULSE SCAN  ({len(st.session_state.active_tickers)} tickers)",
                 type="primary",
@@ -2933,27 +2958,31 @@ elif page == "scanner":
                                 if st.button(btn_label, key=f"exec_swing_{sym}", use_container_width=True):
                                     st.session_state[f"confirm_swing_{sym}"] = True
 
-                        # 0DTE confirm
+                        # 0DTE confirm — hard-blocked if entry window has closed
                         if st.session_state.get(f"confirm_0dte_{sym}"):
-                            st.warning(f"⚠️ Confirm 0DTE paper trade: {direction_r} {sym} @ ~${price} | Grade: {gi}")
-                            cy, cn = st.columns(2)
-                            with cy:
-                                if st.button(f"✅ CONFIRM 0DTE {sym}", key=f"yes_0dte_{sym}", type="primary"):
-                                    exe = get_executor()
-                                    result = exe.submit_equity_order(
-                                        symbol=sym, side='buy' if direction_r=='LONG' else 'sell',
-                                        price=float(price), regime=regime_r,
-                                        trade_type='0DTE', grade=gi,
-                                    )
-                                    if result:
-                                        log_order(result)
-                                        st.success(f"✅ 0DTE order fired! ID: {result['order_id'][:8]}...")
-                                    else:
-                                        st.error("❌ Order blocked by session/regime rules.")
-                                    st.session_state[f"confirm_0dte_{sym}"] = False
-                            with cn:
-                                if st.button(f"❌ Cancel", key=f"cancel_0dte_{sym}"):
-                                    st.session_state[f"confirm_0dte_{sym}"] = False
+                            if _eod_entry_locked:
+                                st.session_state[f"confirm_0dte_{sym}"] = False
+                                st.error("0DTE entry window closed at 3:30 PM ET — order cancelled.", icon="🔒")
+                            else:
+                                st.warning(f"⚠️ Confirm 0DTE paper trade: {direction_r} {sym} @ ~${price} | Grade: {gi}")
+                                cy, cn = st.columns(2)
+                                with cy:
+                                    if st.button(f"✅ CONFIRM 0DTE {sym}", key=f"yes_0dte_{sym}", type="primary"):
+                                        exe = get_executor()
+                                        result = exe.submit_equity_order(
+                                            symbol=sym, side='buy' if direction_r=='LONG' else 'sell',
+                                            price=float(price), regime=regime_r,
+                                            trade_type='0DTE', grade=gi,
+                                        )
+                                        if result:
+                                            log_order(result)
+                                            st.success(f"✅ 0DTE order fired! ID: {result['order_id'][:8]}...")
+                                        else:
+                                            st.error("❌ Order blocked by session/regime rules.")
+                                        st.session_state[f"confirm_0dte_{sym}"] = False
+                                with cn:
+                                    if st.button(f"❌ Cancel", key=f"cancel_0dte_{sym}"):
+                                        st.session_state[f"confirm_0dte_{sym}"] = False
 
                         # Swing confirm
                         if st.session_state.get(f"confirm_swing_{sym}"):

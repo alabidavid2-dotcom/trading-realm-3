@@ -158,17 +158,31 @@ def get_current_regime(window: int = _DECODE_WINDOW) -> dict:
         if df is None or len(df) < 10:
             return {**dict(_NOT_TRAINED), 'error': 'Insufficient SPY data from Alpaca.'}
 
+        # ── Validate OHLC integrity before feature engineering ────────────────
+        required_cols = ['Open', 'High', 'Low', 'Close']
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            return {**dict(_NOT_TRAINED), 'error': f'Missing OHLC columns: {missing}'}
+        if df['Close'].isna().all():
+            return {**dict(_NOT_TRAINED), 'error': 'SPY Close column is all NaN — data feed issue.'}
+
         # ── Feature engineering ───────────────────────────────────────────────
-        import pandas as _pd
         df = df.copy()
+        # Replace any zero Close values to avoid log(0) or divide-by-zero
+        df['Close'] = df['Close'].replace(0, np.nan)
+        df['High']  = df['High'].replace(0, np.nan)
+        df['Low']   = df['Low'].replace(0, np.nan)
         df['log_return'] = np.log(df['Close'] / df['Close'].shift(1))
         df['range']      = (df['High'] - df['Low']) / df['Close']
-        df = df.dropna().tail(window)
+        df = df.replace([np.inf, -np.inf], np.nan).dropna().tail(window)
 
         if len(df) < 5:
             return {**dict(_NOT_TRAINED), 'error': f'Only {len(df)} rows after dropna — need ≥ 5.'}
 
         X = df[features].values
+        # Final NaN guard — numpy will silently corrupt predictions otherwise
+        if np.isnan(X).any() or np.isinf(X).any():
+            return {**dict(_NOT_TRAINED), 'error': 'Feature matrix contains NaN/Inf after cleaning.'}
 
         # ── Decode ────────────────────────────────────────────────────────────
         states      = model.predict(X)          # Viterbi path
