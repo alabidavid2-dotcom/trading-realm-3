@@ -297,6 +297,23 @@ class Executor:
             print(f"[Executor] close_all_positions error: {e}")
             return []
 
+    def kill_switch_0dte(self, swing_tickers: list = None) -> int:
+        """
+        EOD liquidation: close all 0DTE (options) positions, skip swing equity.
+        Delegates to lib.kill_switch.close_0dte_positions for filtering logic.
+        Returns the number of positions closed.
+        """
+        from lib.kill_switch import close_0dte_positions
+        result = close_0dte_positions(self, swing_tickers=swing_tickers or [])
+        n = len(result['closed'])
+        if result['skipped']:
+            print(f"[KillSwitch] Skipped swing positions: {result['skipped']}")
+        if result['errors']:
+            print(f"[KillSwitch] Errors: {result['errors']}")
+        print(f"[KillSwitch] EOD 0DTE close complete — {n} closed, "
+              f"{len(result['skipped'])} swing preserved, {len(result['errors'])} errors.")
+        return n
+
     # --------------------------------------------------
     # MAIN ENTRY POINT: Execute a signal
     # --------------------------------------------------

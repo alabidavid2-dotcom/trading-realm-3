@@ -85,6 +85,18 @@ try:
 except Exception:
     TRADE_SETUP_AVAILABLE = False
 
+# ── EOD Kill Switch ────────────────────────────────────────────────────────────
+try:
+    from lib.kill_switch import get_eod_status, close_0dte_positions
+    KILL_SWITCH_AVAILABLE = True
+except Exception:
+    KILL_SWITCH_AVAILABLE = False
+    def get_eod_status():
+        return {'entry_locked': False, 'hard_close': False,
+                'market_hours': True, 'now_et': '--:--:-- ET', 'today': ''}
+    def close_0dte_positions(*a, **kw):
+        return {'closed': [], 'skipped': [], 'errors': ['Kill switch unavailable']}
+
 # ── HMM Regime Engine ──────────────────────────────────────────────────────────
 try:
     from lib.regime_engine import (
@@ -401,6 +413,39 @@ st.markdown("""
         0%   { background-position: -200% 0; }
         100% { background-position:  200% 0; }
     }
+
+    /* ── Decayed Alpha card ── */
+    .decayed-card {
+        background: linear-gradient(165deg, #0a0808 0%, #100c0c 50%, #0a0808 100%) !important;
+        border: 1.5px solid rgba(239,68,68,0.35) !important;
+        animation: none !important;
+        filter: saturate(0.15) brightness(0.65);
+    }
+    .decayed-card .tc-glare,
+    .decayed-card .tc-foil { display: none !important; }
+    .tc-decay-banner {
+        background: linear-gradient(90deg, #450a0a, #7f1d1d, #450a0a);
+        padding: 5px 10px 4px 10px;
+        border-bottom: 1px solid rgba(239,68,68,0.4);
+        text-align: center;
+    }
+    .tc-static-overlay {
+        position: absolute; inset: 0; z-index: 25; pointer-events: none;
+        background: repeating-linear-gradient(
+            0deg, transparent, transparent 3px,
+            rgba(239,68,68,0.03) 3px, rgba(239,68,68,0.03) 4px
+        );
+        animation: tc-glitch-scan 5s ease-in-out infinite;
+    }
+    @keyframes tc-glitch-scan {
+        0%, 88%, 100% { opacity: 0; }
+        90% { opacity: 1; transform: translateY(-1px); }
+        92% { opacity: 0.6; transform: translateY(1px); }
+        94% { opacity: 0; }
+    }
+
+    /* ── Battle Stations button ── */
+    .pulse-btn-wrap { margin: 16px 0 8px 0; }
 
     #MainMenu { visibility: hidden; }
     footer    { visibility: hidden; }
@@ -1133,6 +1178,39 @@ with st.sidebar:
                 unsafe_allow_html=True,
             )
     is_admin = st.session_state.authenticated
+
+    # ── EOD Kill Switch status (computed once per sidebar render) ─────────────
+    _eod = get_eod_status()
+    _eod_entry_locked = _eod['entry_locked']
+    _eod_hard_close   = _eod['hard_close']
+
+    if _eod_hard_close:
+        st.markdown(
+            '<div style="background:linear-gradient(90deg,#450a0a,#7f1d1d,#450a0a);'
+            'border:1.5px solid rgba(239,68,68,0.6);border-radius:8px;'
+            'padding:10px 12px;margin:6px 0 10px 0;text-align:center;">'
+            '<div style="font-family:DM Mono,monospace;font-size:10px;font-weight:700;'
+            'color:#ef4444;letter-spacing:2px;text-transform:uppercase;">'
+            '&#9888; EOD KILL SWITCH ACTIVE</div>'
+            '<div style="font-family:DM Mono,monospace;font-size:9px;color:#fca5a5;'
+            'margin-top:3px;letter-spacing:1px;">0DTE LIQUIDATION IN PROGRESS</div>'
+            '<div style="font-family:DM Mono,monospace;font-size:8px;color:#7f1d1d;'
+            'margin-top:4px;">' + _eod['now_et'] + '</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    elif _eod_entry_locked:
+        st.markdown(
+            '<div style="background:#1c0a0a;border:1px solid rgba(239,68,68,0.35);'
+            'border-radius:8px;padding:8px 12px;margin:4px 0 8px 0;text-align:center;">'
+            '<div style="font-family:DM Mono,monospace;font-size:10px;font-weight:700;'
+            'color:#f87171;letter-spacing:1px;">&#128274; 0DTE ENTRY LOCK</div>'
+            '<div style="font-family:DM Mono,monospace;font-size:9px;color:#7f1d1d;'
+            'margin-top:2px;">No new 0DTE orders after 3:30 PM ET</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
     st.markdown("---")
 
     # ── Show help guide if active, otherwise show settings ───────────────────
@@ -1891,13 +1969,38 @@ if page == "ticker":
 
 elif page == "scanner":
     show_tab_header("scanner", "🎯 S&P 500 Scanner", datetime.now().strftime('%B %d, %Y'))
+
+    # ── EOD auto-liquidation (fires once per day after 15:50 ET) ─────────────
+    if is_admin and _eod_hard_close:
+        _fired_date = st.session_state.get('eod_fired_date', '')
+        if _fired_date != _eod['today']:
+            st.session_state['eod_fired_date'] = _eod['today']
+            _eod_exe = get_executor()
+            # Derive swing tickers from this session's order log (don't close overnight holds)
+            _swing_held = list({
+                o['ticker'] for o in st.session_state.get('order_log', [])
+                if o.get('trade_type', '').lower() == 'swing'
+                and o.get('status') not in ('ERROR', 'BLOCKED')
+            })
+            if _eod_exe:
+                _ks_n = _eod_exe.kill_switch_0dte(swing_tickers=_swing_held)
+                st.error(
+                    f"⚠️ EOD KILL SWITCH ACTIVE — 0DTE liquidation fired at {_eod['now_et']}. "
+                    f"{_ks_n} position(s) closed. "
+                    + (f"Swing held: {', '.join(_swing_held)}." if _swing_held else "No swing positions."),
+                    icon="🚨",
+                )
+
     render_daily_loss_gate()
 
     if 'scan_history'      not in st.session_state: st.session_state.scan_history      = load_scan_history()
     if 'last_scan_results' not in st.session_state: st.session_state.last_scan_results = None
     if 'play_sound'        not in st.session_state: st.session_state.play_sound        = False
-
     if 'fast_scan_results' not in st.session_state: st.session_state.fast_scan_results = None
+    # Pulse Scan persistence
+    if 'active_tickers'   not in st.session_state: st.session_state.active_tickers    = []
+    if 'alpha_snapshot'   not in st.session_state: st.session_state.alpha_snapshot     = {}
+    if 'pulse_decay'      not in st.session_state: st.session_state.pulse_decay        = {}
 
     _RO = ('<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
            'border-radius:8px;padding:7px 10px;font-family:DM Mono,monospace;'
@@ -1949,6 +2052,16 @@ elif page == "scanner":
         progress_bar.progress(100)
         status_text.markdown(f"<div style='color:#22c55e;font-family:JetBrains Mono,monospace;font-size:13px;'>✅ Complete: {results['total_scanned']} scanned → {len(results['all_qualified'])} qualified</div>", unsafe_allow_html=True)
 
+        # Snapshot for Pulse Scan decay detection
+        _snap_rows = results.get('all_qualified', [])
+        st.session_state.active_tickers = [_s['ticker'] for _s in _snap_rows]
+        st.session_state.alpha_snapshot = {
+            _s['ticker']: {'ptr': _s.get('ptr_score', 0), 'price': _s.get('price'),
+                           'dir': _s.get('direction', 'FLAT'), 'gap_type': _s.get('gap_type', '')}
+            for _s in _snap_rows
+        }
+        st.session_state.pulse_decay = {}
+
         history = merge_scan_results(results['all_qualified'], st.session_state.scan_history)
         st.session_state.scan_history = history; save_scan_history(history)
 
@@ -1981,6 +2094,14 @@ elif page == "scanner":
         _fr = run_watchlist_scan(tickers=ALL_TICKERS, timeout_secs=7.5, progress_callback=_fast_progress)
         st.session_state.fast_scan_results = _fr
         _fp.progress(100)
+        # Snapshot for Pulse Scan decay detection
+        st.session_state.active_tickers = [_r['ticker'] for _r in _fr.get('results', [])]
+        st.session_state.alpha_snapshot  = {
+            _r['ticker']: {'ptr': _r.get('ptr_score', 0), 'price': _r.get('price'),
+                           'dir': _r.get('direction', 'FLAT'), 'gap_type': _r.get('gap_type', '')}
+            for _r in _fr.get('results', [])
+        }
+        st.session_state.pulse_decay = {}
         _warn = f" ⚠️ {_fr['warning']}" if _fr.get('truncated') else ""
         _fs.markdown(
             f"<div style='color:#22c55e;font-family:JetBrains Mono,monospace;font-size:13px;'>"
@@ -1988,6 +2109,98 @@ elif page == "scanner":
             f"ranked by FTFC alignment{_warn}</div>",
             unsafe_allow_html=True,
         )
+
+    # ── Pulse Scan: re-check active tickers for decay ────────────────────────
+    if st.session_state.active_tickers:
+        if is_admin:
+            _pulse_clicked = st.button(
+                f"⚡ BATTLE STATIONS: PULSE SCAN  ({len(st.session_state.active_tickers)} tickers)",
+                type="primary",
+                use_container_width=True,
+                key="pulse_scan_btn",
+            )
+        else:
+            _pulse_clicked = False
+            st.markdown(
+                '<div style="background:#0f172a;border:1px solid rgba(99,102,241,0.12);'
+                'border-radius:8px;padding:10px;font-family:DM Mono,monospace;'
+                'font-size:11px;color:#374151;text-align:center;margin:8px 0;">'
+                '🔒 BATTLE STATIONS locked — Read-Only Mode</div>',
+                unsafe_allow_html=True,
+            )
+
+        if _pulse_clicked:
+            _pb = st.progress(0); _ps = st.empty()
+
+            def _pulse_prog(stage, current, total, message):
+                _pb.progress(min(int((current / max(1, total)) * 100), 100))
+                _ps.markdown(
+                    f"<div style='color:#94a3b8;font-family:DM Mono,monospace;font-size:13px;'>"
+                    f"⚡ {message}</div>", unsafe_allow_html=True,
+                )
+
+            _pr = run_watchlist_scan(
+                tickers=st.session_state.active_tickers,
+                timeout_secs=10,
+                progress_callback=_pulse_prog,
+            )
+            _pb.progress(100)
+
+            # ── Decay detection ─────────────────────────────────────────────
+            _snap       = st.session_state.alpha_snapshot
+            _grade_rank = {'A+': 3, 'A': 2, 'B': 1, 'C': 0}
+
+            def _ptr_to_grade(ptr):
+                if ptr >= 75: return 'A+'
+                if ptr >= 60: return 'A'
+                if ptr >= 45: return 'B'
+                return 'C'
+
+            _new_decay = {}
+            for _pr_row in _pr.get('results', []):
+                _t  = _pr_row['ticker']
+                _sn = _snap.get(_t, {})
+                if not _sn:
+                    continue
+                _snap_ptr   = _sn.get('ptr', 0)
+                _snap_price = _sn.get('price') or _pr_row.get('price')
+                _snap_dir   = _sn.get('dir', 'FLAT')
+                _new_ptr    = _pr_row.get('ptr_score', 0)
+                _new_price  = _pr_row.get('price') or _snap_price
+                _sg  = _ptr_to_grade(_snap_ptr)
+                _ng  = _ptr_to_grade(_new_ptr)
+                _grade_dropped = _grade_rank.get(_ng, 0) < _grade_rank.get(_sg, 0)
+                _mag_decayed = False
+                try:
+                    if _snap_price and _new_price:
+                        _sp, _np = float(_snap_price), float(_new_price)
+                        if _snap_dir == 'LONG':
+                            _prog = (_np - _sp) / max(_sp * 0.05, 0.01)
+                        elif _snap_dir == 'SHORT':
+                            _prog = (_sp - _np) / max(_sp * 0.05, 0.01)
+                        else:
+                            _prog = 0
+                        _mag_decayed = _prog >= 0.30
+                except Exception:
+                    pass
+                _reasons = []
+                if _grade_dropped:  _reasons.append(f"Grade {_sg}→{_ng}")
+                if _mag_decayed:    _reasons.append("≥30% move captured")
+                _new_decay[_t] = {
+                    'is_decayed': _grade_dropped or _mag_decayed,
+                    'reasons':    _reasons,
+                    'snap_grade': _sg, 'new_grade': _ng,
+                }
+
+            st.session_state.pulse_decay = _new_decay
+            _n_dec = sum(1 for v in _new_decay.values() if v['is_decayed'])
+            _ps.markdown(
+                f"<div style='color:#22c55e;font-family:DM Mono,monospace;font-size:13px;'>"
+                f"✅ Pulse complete — {len(st.session_state.active_tickers)} tickers checked · "
+                f"<span style='color:#ef4444;'>{_n_dec} DECAYED</span> · "
+                f"{len(st.session_state.active_tickers) - _n_dec} still live</div>",
+                unsafe_allow_html=True,
+            )
 
     # ── Fast Scan Results Display ─────────────────────────────────────────────
     _fsr = st.session_state.get('fast_scan_results')
@@ -2017,7 +2230,7 @@ elif page == "scanner":
         _regime_risk_mult = 0.5 if 'Volatile' in _scan_regime else 1.0
 
         # ── Pokémon-style trade card builder (Pass 1 skeleton → Pass 2 chart) ──
-        def _make_card_html(cv, art_html=''):
+        def _make_card_html(cv, art_html='', decayed=False):
             d         = cv['dir']
             ptr       = cv['ptr']
             hp_color  = '#22c55e' if ptr >= 70 else ('#f59e0b' if ptr >= 40 else '#ef4444')
@@ -2025,7 +2238,22 @@ elif page == "scanner":
             dir_color = '#4ade80' if d == 'LONG' else ('#f87171' if d == 'SHORT' else '#6b7280')
             dir_arrow = '▲' if d == 'LONG' else ('▼' if d == 'SHORT' else '—')
             ps        = ('$' + str(cv['price'])) if cv['price'] else '—'
-            card_cls  = 'trade-card alpha-glow' if cv.get('alpha_setup') else 'trade-card'
+            if decayed:
+                card_cls     = 'trade-card decayed-card'
+                decay_banner = (
+                    '<div class="tc-decay-banner">'
+                    '<div style="font-family:\'DM Mono\',monospace;font-size:10px;font-weight:700;'
+                    'color:#ef4444;letter-spacing:2px;text-transform:uppercase;">'
+                    '&#9888; DECAYED ALPHA | SUPER EFFECTIVE (-)</div>'
+                    '<div style="font-family:\'DM Mono\',monospace;font-size:9px;color:#7f1d1d;'
+                    'margin-top:2px;letter-spacing:1px;">MOVE PASSED &#8212; DO NOT CHASE</div>'
+                    '</div>'
+                )
+                static_overlay = '<div class="tc-static-overlay"></div>'
+            else:
+                card_cls       = 'trade-card alpha-glow' if cv.get('alpha_setup') else 'trade-card'
+                decay_banner   = ''
+                static_overlay = ''
 
             # Compact sector badge
             sec_etf = cv.get('sector_etf', '')
@@ -2078,10 +2306,11 @@ elif page == "scanner":
                 '<div style="text-align:center;font-size:11px;color:#fb923c;'
                 'font-family:\'DM Mono\',monospace;font-weight:700;letter-spacing:1px;'
                 'padding:5px 0 1px 0;">\U0001f525 ALPHA SETUP</div>'
-            ) if cv.get('alpha_setup') else ''
+            ) if (cv.get('alpha_setup') and not decayed) else ''
 
             return (
                 '<div class="' + card_cls + '">'
+                + static_overlay + decay_banner +
                 '<div class="tc-glare"></div>'
                 '<div class="tc-foil"></div>'
                 '<div class="tc-inner">'
@@ -2264,11 +2493,15 @@ elif page == "scanner":
                 'gap_pct':     _gap_pct,
                 'ftfc_stack':  _stack,
             }
+            _decay_info = st.session_state.get('pulse_decay', {}).get(_sym, {})
+            _is_decayed = _decay_info.get('is_decayed', False)
+            _cv['_is_decayed'] = _is_decayed
+
             _col = _cols[_ci % 5]
             with _col:
                 # Pass 1 — instant render with shimmer skeleton where chart will go
                 _ph = st.empty()
-                _ph.markdown(_make_card_html(_cv, _SKELETON_ART), unsafe_allow_html=True)
+                _ph.markdown(_make_card_html(_cv, _SKELETON_ART, decayed=_is_decayed), unsafe_allow_html=True)
                 _card_slots.append((_ph, _cv))
 
                 # ── Trade Setup expander ──────────────────────────────────────────
@@ -2407,7 +2640,15 @@ elif page == "scanner":
                                             if 'pending_runners' not in st.session_state:
                                                 st.session_state.pending_runners = []
                                             _runner_key = _ts['occ_symbol']
-                                            if is_admin:
+                                            if is_admin and _ts_type == 'intraday' and _eod_entry_locked:
+                                                st.markdown(
+                                                    '<div style="background:#1c0a0a;border:1px solid rgba(239,68,68,0.35);'
+                                                    'border-radius:6px;padding:5px 8px;font-family:DM Mono,monospace;'
+                                                    'font-size:9px;color:#f87171;text-align:center;">'
+                                                    '&#128274; Runner locked after 3:30 PM ET</div>',
+                                                    unsafe_allow_html=True,
+                                                )
+                                            elif is_admin:
                                                 if st.button(
                                                     f"Activate Runner — {_sym}",
                                                     key=f"runner_{_runner_key}_{_ts_type}",
@@ -2456,7 +2697,7 @@ elif page == "scanner":
                     '<img src="data:image/png;base64,' + _b64 + '" '
                     'style="width:100%;height:80px;object-fit:fill;display:block;" />'
                 )
-                _ph.markdown(_make_card_html(_cv, _chart_art), unsafe_allow_html=True)
+                _ph.markdown(_make_card_html(_cv, _chart_art, decayed=_cv.get('_is_decayed', False)), unsafe_allow_html=True)
 
     history = st.session_state.scan_history
 
@@ -2672,9 +2913,20 @@ elif page == "scanner":
                         ecols = st.columns([1, 1, 2])
                         with ecols[0]:
                             if is_executable_grade(gi):
-                                btn_label = f"⚡ 0DTE {direction_r} {sym}"
-                                if st.button(btn_label, key=f"exec_0dte_{sym}", type="primary", use_container_width=True):
-                                    st.session_state[f"confirm_0dte_{sym}"] = True
+                                if _eod_entry_locked:
+                                    st.markdown(
+                                        '<div style="background:#1c0a0a;border:1px solid rgba(239,68,68,0.35);'
+                                        'border-radius:6px;padding:5px 8px;font-family:DM Mono,monospace;'
+                                        'font-size:9px;color:#f87171;text-align:center;">'
+                                        '&#128274; 0DTE LOCKED<br>'
+                                        '<span style="color:#7f1d1d;font-size:8px;">Entry closed after 3:30 PM ET</span>'
+                                        '</div>',
+                                        unsafe_allow_html=True,
+                                    )
+                                else:
+                                    btn_label = f"⚡ 0DTE {direction_r} {sym}"
+                                    if st.button(btn_label, key=f"exec_0dte_{sym}", type="primary", use_container_width=True):
+                                        st.session_state[f"confirm_0dte_{sym}"] = True
                         with ecols[1]:
                             if is_executable_grade(gs):
                                 btn_label = f"📊 SWING {direction_r} {sym}"
