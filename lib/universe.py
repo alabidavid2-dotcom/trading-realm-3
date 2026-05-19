@@ -40,6 +40,14 @@ def get_sector_for_ticker(ticker: str) -> str:
     return 'Other'
 
 
+# Reverse lookup: ticker → sector (built from SECTOR_GROUPS)
+TICKER_TO_SECTOR: dict = {
+    ticker: sector
+    for sector, tickers in SECTOR_GROUPS.items()
+    for ticker in tickers
+}
+
+
 def load_universe() -> list[dict]:
     try:
         res = supabase.table('universe_members').select('*').order('score', desc=True).execute()
@@ -199,6 +207,77 @@ def auto_build_universe(scan_history: list[dict]) -> list[dict]:
             universe.append(s)
 
     return load_universe()
+
+
+def get_ranked_universe(min_appearances: int = 1) -> list[dict]:
+    """
+    Return universe members sorted by score, optionally filtered by minimum scan appearances.
+    Merges Supabase row data with metadata field for a flat dict per ticker.
+    """
+    universe = load_universe()
+    out = []
+    for u in universe:
+        meta = u.get('metadata') or {}
+        appearances = int(meta.get('appearances', u.get('appearances', 0)) or 0)
+        if appearances < min_appearances:
+            continue
+        entry = {
+            'ticker':         u.get('ticker', ''),
+            'sector':         u.get('sector', 'Other'),
+            'score':          float(u.get('score', 0)),
+            'ptr_score':      float(u.get('ptr_score', 0)),
+            'a_grade_rate':   float(meta.get('a_grade_rate', u.get('a_grade_rate', 0)) or 0),
+            'avg_confidence': float(meta.get('avg_confidence', u.get('avg_confidence', 0)) or 0),
+            'appearances':    appearances,
+            'last_seen':      meta.get('last_seen', u.get('last_seen', '')),
+            'last_regime':    meta.get('last_regime', u.get('last_regime', '')),
+        }
+        out.append(entry)
+    out.sort(key=lambda x: x['score'], reverse=True)
+    return out
+
+
+def update_universe_from_scan(scan_results: list[dict]) -> None:
+    """
+    Update universe scores after each Full S&P scan.
+    Takes the qualified scan results list and upserts PTR scores.
+    Tickers that cross the universe_score threshold (≥60) are auto-added.
+    Safe to call with an empty list — just returns.
+    """
+    if not scan_results:
+        return
+
+    from collections import defaultdict
+    # Build per-ticker history from current results only
+    ticker_map: dict = defaultdict(list)
+    for r in scan_results:
+        t = r.get('ticker')
+        if t:
+            ticker_map[t].append(r)
+
+    current_universe = load_universe()
+    current_tickers  = {u['ticker'] for u in current_universe}
+
+    for ticker, history in ticker_map.items():
+        score_data = calculate_universe_score(history)
+        if score_data.get('in_universe') and ticker not in current_tickers:
+            # Auto-add tickers that qualify
+            add_to_universe(ticker, score_data)
+        elif ticker in current_tickers:
+            # Update existing universe member's score
+            try:
+                new_score = float(score_data.get('universe_score', 0))
+                new_ptr   = float(score_data.get('ptr_score', 0))
+                new_meta  = {k: v for k, v in score_data.items()
+                             if k not in ('ticker', 'sector', 'added_at')}
+                (
+                    supabase.table('universe_members')
+                    .update({'score': new_score, 'ptr_score': new_ptr, 'metadata': new_meta})
+                    .eq('ticker', ticker)
+                    .execute()
+                )
+            except Exception:
+                pass
 
 
 def get_universe_summary() -> dict:

@@ -123,7 +123,7 @@ def tier1_quick_screen(ticker):
         return None
 
 
-def tier2_full_analysis(ticker, train_days=730):
+def tier2_full_analysis(ticker, train_days=365):
     """Tier 2: Full HMM + indicators + Strat. Returns complete analysis or None."""
     try:
         from lib.data_client import get_daily
@@ -148,7 +148,7 @@ def tier2_full_analysis(ticker, train_days=730):
 
         try:
             from hmmlearn.hmm import GaussianHMM
-            model = GaussianHMM(n_components=5, covariance_type='full', n_iter=200, random_state=42)
+            model = GaussianHMM(n_components=5, covariance_type='full', n_iter=50, random_state=42)
             model.fit(X)
             states = model.predict(X)
             df['regime_id'] = states
@@ -583,8 +583,14 @@ def run_watchlist_scan(tickers: list = None, timeout_secs: float = 7.5, progress
 def run_full_scan(progress_callback=None, max_workers=10):
     """
     Full two-tier scan. Returns top 10 + all qualified results.
+    Always includes core ETFs (SPY, QQQ, IWM) even when Wikipedia fetch works.
     """
+    from config import CORE_INDICES
     tickers = get_sp500_tickers()
+    # Ensure core indices (QQQ, SPY, IWM) are always included
+    for _core in CORE_INDICES:
+        if _core not in tickers:
+            tickers.insert(0, _core)
     total = len(tickers)
 
     if progress_callback:
@@ -604,7 +610,7 @@ def run_full_scan(progress_callback=None, max_workers=10):
                     f"Tier 1: {done}/{total} | {len(tier1_results)} candidates")
 
     tier1_results.sort(key=lambda x: abs(x['quick_score']), reverse=True)
-    candidates = tier1_results[:80]
+    candidates = tier1_results[:40]
 
     if progress_callback:
         progress_callback("tier2", 0, len(candidates),
@@ -614,18 +620,27 @@ def run_full_scan(progress_callback=None, max_workers=10):
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(tier2_full_analysis, c['ticker']): c['ticker'] for c in candidates}
         done = 0
-        for future in as_completed(futures):
-            done += 1
-            result = future.result()
-            if result:
-                tier2_results.append(result)
-            if progress_callback and done % 10 == 0:
+        try:
+            for future in as_completed(futures, timeout=180):  # 3-minute wall-clock cap
+                done += 1
+                try:
+                    result = future.result(timeout=8)  # 8s per ticker — kills stalled HMM fits
+                except Exception:
+                    result = None
+                if result:
+                    tier2_results.append(result)
+                if progress_callback and done % 10 == 0:
+                    progress_callback("tier2", done, len(candidates),
+                        f"Tier 2: {done}/{len(candidates)} | {len(tier2_results)} analyzed")
+        except Exception:
+            # Wall-clock timeout hit — use whatever results we have so far
+            if progress_callback:
                 progress_callback("tier2", done, len(candidates),
-                    f"Tier 2: {done}/{len(candidates)} | {len(tier2_results)} analyzed")
+                    f"Tier 2: timeout — using {len(tier2_results)} results collected")
 
     qualified = [
         r for r in tier2_results
-        if r['confidence'] >= 85 and abs(r['composite']) >= 30
+        if r['confidence'] >= 60 and abs(r['composite']) >= 30
     ]
     qualified.sort(key=lambda x: abs(x['composite']), reverse=True)
 
@@ -834,10 +849,9 @@ def generate_sparkline_base64(ticker: str, days: int = 14) -> str:
         ax.set_yticks([])
 
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=72, bbox_inches='tight',
-                    facecolor=fig.get_facecolor(), pad_inches=0.05)
+        plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, dpi=100)
         plt.close(fig)
         buf.seek(0)
-        return base64.b64encode(buf.read()).decode('ascii')
+        return base64.b64encode(buf.read()).decode('utf-8')
     except Exception:
         return ''

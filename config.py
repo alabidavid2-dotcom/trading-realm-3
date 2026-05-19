@@ -73,6 +73,11 @@ CORE_INDICES = ['SPY', 'QQQ', 'IWM']
 WATCHLIST    = ['NVDA', 'AAPL', 'TSLA', 'MU', 'WMT', 'UNH', 'ELF', 'GM']
 ALL_TICKERS  = CORE_INDICES + WATCHLIST
 
+# ── FAST WATCHLIST — Fixed portfolio for the ⚡ Fast Scan ────────────────────────
+# FTFC-only scan (no HMM / Strat). Weighted toward David's core holdings.
+# Allocation: 20% VOO · 20% VGT · 25% SMH · 15% NVDA · 10% MSFT · 10% AMZN
+FAST_WATCHLIST = ['VOO', 'VGT', 'SMH', 'NVDA', 'MSFT', 'AMZN']
+
 # ── HMM REGIME SETTINGS ──────────────────────────────────────────────────────────
 HMM_N_REGIMES    = 5
 HMM_TRAIN_DAYS   = 700
@@ -111,7 +116,7 @@ STRAT_TIMEFRAMES = {
 }
 
 # ── RISK MANAGEMENT ──────────────────────────────────────────────────────────────
-RISK_BASE_0DTE   = 75
+RISK_BASE_0DTE   = 150
 RISK_BASE_SWING  = 150
 CONTRACTS_MIN    = 2
 CONTRACTS_MAX    = 4

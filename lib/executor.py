@@ -454,24 +454,55 @@ class Executor:
 import math
 from datetime import date as _date, timedelta as _td
 
-_INTRADAY_RISK = 30   # PRD: max $ loss per intraday trade
-_SWING_RISK    = 60   # PRD: max $ loss per swing trade
+_INTRADAY_RISK = 150   # PRD: max $ loss per intraday trade
+_SWING_RISK    = 150   # PRD: max $ loss per swing trade
 
 
 def get_expiration_date(trade_type: str) -> _date:
     """
-    Intraday → nearest Friday (today if already Friday).
-    Swing    → first Friday that is 7-14 days out.
+    Intraday → next Friday from execution date (today if today IS Friday).
+    Swing    → first Friday in 14-45 day window from execution date.
+               Returns the Friday closest to 30 days out as default.
     """
     today        = _date.today()
     days_to_fri  = (4 - today.weekday()) % 7   # 0 when today IS Friday
     nearest_fri  = today + _td(days=days_to_fri)
     if trade_type == 'intraday':
         return nearest_fri
+    # Swing: collect all Fridays between 14 and 45 days out, pick closest to 30
+    swing_fridays = []
     candidate = nearest_fri
-    while (candidate - today).days < 7:
+    while (candidate - today).days < 14:
         candidate += _td(weeks=1)
-    return candidate
+    while (candidate - today).days <= 45:
+        swing_fridays.append(candidate)
+        candidate += _td(weeks=1)
+    if not swing_fridays:
+        # Fallback: first Friday at least 14 days out
+        candidate = nearest_fri
+        while (candidate - today).days < 14:
+            candidate += _td(weeks=1)
+        return candidate
+    # Pick Friday closest to 30 days
+    target_days = 30
+    return min(swing_fridays, key=lambda d: abs((d - today).days - target_days))
+
+
+def get_swing_expiry_range() -> list:
+    """
+    Return all Fridays between 14 and 45 days from today.
+    Used by build_trade_setup to search for the best swing contract.
+    """
+    today    = _date.today()
+    days_fri = (4 - today.weekday()) % 7
+    candidate = today + _td(days=days_fri)
+    while (candidate - today).days < 14:
+        candidate += _td(weeks=1)
+    fridays = []
+    while (candidate - today).days <= 45:
+        fridays.append(candidate)
+        candidate += _td(weeks=1)
+    return fridays
 
 
 def _strike_increment(price: float) -> float:
@@ -637,8 +668,30 @@ def build_trade_setup(
     dte    = max(0, (expiry - _date.today()).days)
 
     # ── 1. Live chain (best-effort) ───────────────────────────────────────────
-    live   = fetch_itm_contract(ticker, contract_type, expiry, spot_price)
-    source = 'live'
+    live   = None
+    source = 'estimate'
+
+    if is_intraday:
+        # 0DTE: single expiry — first Friday from execution date
+        live = fetch_itm_contract(ticker, contract_type, expiry, spot_price)
+        if live and live.get('ask'):
+            source = 'live'
+    else:
+        # Swing: search 14-45 day window for best live contract
+        swing_dates = get_swing_expiry_range()
+        for _sw_date in swing_dates:
+            _candidate = fetch_itm_contract(ticker, contract_type, _sw_date, spot_price)
+            if _candidate and _candidate.get('ask'):
+                live   = _candidate
+                expiry = _sw_date
+                dte    = max(0, (expiry - _date.today()).days)
+                source = 'live'
+                break
+        if live is None:
+            # No live contract found → use default expiry (closest to 30 days)
+            expiry = get_expiration_date('swing')
+            dte    = max(0, (expiry - _date.today()).days)
+
     if live and live.get('ask'):
         strike     = live['strike']
         premium    = live['ask']        # use ask for conservative sizing
@@ -728,6 +781,63 @@ def build_trade_setup(
     }
 
 
+def execute_paper_order(trade_setup: dict, context: dict = None) -> dict:
+    """
+    One-shot paper execution from a build_trade_setup() output dict.
+    Uses the pre-computed OCC symbol — no second chain lookup needed.
+
+    Returns dict: {status, order_id, occ_symbol, contracts, cost, error?}
+    """
+    occ    = trade_setup.get('occ_symbol', '')
+    qty    = trade_setup.get('contracts', 1)
+    ticker = trade_setup.get('ticker', '')
+    ct     = trade_setup.get('contract_type', 'CALL')
+
+    result = {
+        'timestamp':  datetime.now().isoformat(),
+        'occ_symbol': occ,
+        'ticker':     ticker,
+        'contracts':  qty,
+        'cost':       trade_setup.get('total_cost', 0),
+        'trade_type': trade_setup.get('trade_type', ''),
+        'direction':  'LONG' if ct == 'CALL' else 'SHORT',
+        'paper':      True,
+        'status':     'PENDING',
+    }
+
+    try:
+        key, sec = get_alpaca_keys()
+        if not key or not sec:
+            result['status']   = 'DRY_RUN'
+            result['order_id'] = f"DRY-{ticker}-{int(time.time())}"
+            return result
+
+        # Always paper=True for this function — it is intentionally paper-only
+        tc = TradingClient(api_key=key, secret_key=sec, paper=True)
+        req = MarketOrderRequest(
+            symbol=occ,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+        )
+        order = tc.submit_order(req)
+        result['status']   = str(order.status)
+        result['order_id'] = str(order.id)
+
+    except Exception as exc:
+        result['status'] = 'ERROR'
+        result['error']  = str(exc)
+
+    # Persist to Supabase if context provided and no error
+    if result['status'] not in ('ERROR', 'DRY_RUN', 'PENDING'):
+        try:
+            log_trade_to_supabase(trade_setup, context or {})
+        except Exception:
+            pass
+
+    return result
+
+
 # ── Aliases so app.py can import these names ──────────────────────────────────
 AlpacaExecutor = Executor
 
@@ -798,108 +908,5 @@ def log_trade_to_supabase(
         res = supabase.table('trade_log').insert(row).execute()
         return res.data[0]['id'] if res.data else None
     except Exception as exc:
-        print(f"[TradeLog] insert failed: {exc}")
+        print(f'[TradeLog] insert failed: {exc}')
         return None
-
-
-def log_trade_exit(
-    occ_symbol:    str,
-    exit_premium:  float,
-    exit_reason:   str,
-    peak_premium:  float = None,
-    entry_premium: float = None,
-) -> bool:
-    """
-    Update the matching open trade_log row with exit details.
-
-    Calculates P&L from entry/exit premiums if both are available.
-    Returns True on success.
-    """
-    from datetime import timezone as _tz
-
-    pnl_dollars = pnl_pct = None
-    if entry_premium and exit_premium:
-        pnl_dollars = round((exit_premium - entry_premium) * 100, 2)
-        pnl_pct     = round((exit_premium / entry_premium - 1) * 100, 2)
-
-    update = {
-        'exit_premium': exit_premium,
-        'exit_reason':  exit_reason,
-        'status':       'closed',
-        'exited_at':    datetime.now(_tz.utc).isoformat(),
-    }
-    if peak_premium  is not None: update['peak_premium'] = peak_premium
-    if pnl_dollars   is not None: update['pnl_dollars']  = pnl_dollars
-    if pnl_pct       is not None: update['pnl_pct']      = pnl_pct
-
-    try:
-        from config import supabase
-        supabase.table('trade_log').update(update).eq(
-            'occ_symbol', occ_symbol
-        ).eq('status', 'open').execute()
-        return True
-    except Exception as exc:
-        print(f"[TradeLog] exit update failed: {exc}")
-        return False
-
-
-def fetch_trade_log(limit: int = 200) -> list[dict]:
-    """Return recent trade_log rows for the Performance tab."""
-    try:
-        from config import supabase
-        res = supabase.table('trade_log').select('*').order(
-            'entered_at', desc=True
-        ).limit(limit).execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
-def execute_signal(ticker: str, signal: dict, executor=None) -> dict:
-    """Module-level wrapper — delegates to an Executor instance."""
-    ex = executor or Executor()
-    return ex.execute_signal(ticker, signal)
-
-
-def start_kill_switch_scheduler(executor=None):
-    """Placeholder — kill-switch scheduler attaches to the executor session."""
-    pass
-
-
-# --------------------------------------------------
-# QUICK TEST / DEMO
-# --------------------------------------------------
-
-if __name__ == "__main__":
-    from lib.signal_engine import generate_signal
-
-    ex = Executor()
-
-    # Print account info
-    acct = ex.get_account()
-    print("\n--- Account ---")
-    for k, v in acct.items():
-        print(f"  {k}: {v}")
-
-    # Simulate a strong bull signal
-    dummy_signal = {
-        "composite_score": 65,
-        "direction": "LONG",
-        "strength": "STRONG",
-        "trade_type": "0DTE_CALL",
-        "confidence": 78,
-        "risk_multiplier": 1.0,
-        "regime_score": 40,
-        "indicator_score": 15,
-        "strat_score": 10,
-        "reasoning": ["Test signal"],
-    }
-
-    print("\n--- Executing dummy LONG signal on SPY ---")
-    result = ex.execute_signal("SPY", dummy_signal)
-    print(f"  Result: {result}")
-
-    print("\n--- Session Summary ---")
-    summary = ex.session_summary()
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
