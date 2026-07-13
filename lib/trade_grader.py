@@ -8,8 +8,13 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import warnings
 warnings.filterwarnings('ignore')
+
+# All session logic runs in market time. America/New_York handles EST/EDT
+# automatically — never use naive datetime.now() here (UTC on Streamlit Cloud).
+ET = ZoneInfo("America/New_York")
 
 # ── HMM Regime cache (TTL: 5 min so every grade call doesn't re-fetch) ────────
 _regime_cache: dict = {}
@@ -93,10 +98,13 @@ def get_session_context():
       15:00-15:45 = Final push (caution, theta)
       15:45-16:00 = Exit all 0DTE
     """
-    now = datetime.now()
+    now = datetime.now(ET)
     h, m = now.hour, now.minute
-    t = h * 60 + m  # Minutes since midnight
+    t = h * 60 + m  # Minutes since midnight ET
 
+    if now.weekday() >= 5:  # Sat/Sun — mirror of the market_monitor.ts weekend guard
+        return {'session': 'Weekend', 'allow_0dte': False, 'allow_swing': False,
+                'quality': 'closed', 'note': 'Market closed — weekend'}
     if t < 9 * 60 + 30:
         return {'session': 'Pre-Market', 'allow_0dte': False, 'allow_swing': True,
                 'quality': 'prep', 'note': 'Pre-market prep window'}
