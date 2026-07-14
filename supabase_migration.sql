@@ -66,5 +66,7 @@ CREATE INDEX IF NOT EXISTS idx_tl_entered    ON public.trade_log (entered_at DES
 CREATE INDEX IF NOT EXISTS idx_tl_alpha      ON public.trade_log (alpha_setup);
 
 -- Enable Row Level Security but allow all for now (tighten per-user later)
+-- Note: CREATE POLICY has no IF NOT EXISTS clause in Postgres; DROP+CREATE is the idiom (fixed S148 2026-07-14).
 ALTER TABLE public.trade_log ENABLE ROW LEVEL SECURITY;
-CREATE POLICY IF NOT EXISTS "allow_all" ON public.trade_log FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "allow_all" ON public.trade_log;
+CREATE POLICY "allow_all" ON public.trade_log FOR ALL USING (true) WITH CHECK (true);
